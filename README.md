@@ -15,7 +15,7 @@ uv pip install -e .
 RunPod / any GPU image (torch already present — do **not** reinstall it):
 
 ```bash
-uv pip install --system -e ".[train]"
+pip install -e ".[train]"
 ```
 
 No virtualenv: the pod is disposable, and its torch is built against the

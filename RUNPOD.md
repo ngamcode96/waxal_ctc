@@ -60,11 +60,20 @@ EOF
 ```bash
 git clone <your-repo> /workspace/waxal
 cd /workspace/waxal
-uv pip install --system -e ".[train]"
+pip install -e ".[train]"
 ```
 
-No virtualenv: the pod is disposable and its torch is built against the image's
-driver. The `train` extra deliberately excludes torch so this never replaces it.
+RunPod images ship `pip`, not `uv`, and nothing here needs uv. If you prefer it:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+uv pip install --system -e ".[train]"      # --system is required, no venv here
+```
+
+No virtualenv either way: the pod is disposable and its torch is built against
+the image's driver. The `train` extra deliberately excludes torch so this never
+replaces it.
 
 Verify before going further:
 
