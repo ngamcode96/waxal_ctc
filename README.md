@@ -30,6 +30,9 @@ A machine with no torch at all (rare) needs `".[train,torch]"`.
 
 ## Training
 
+Full RunPod walkthrough — pod config, storage, costs, recovery, gotchas:
+**[RUNPOD.md](RUNPOD.md)**. Quick version:
+
 ```bash
 export HF_TOKEN=hf_...        # needs write permission
 python scripts/train_ctc.py \
