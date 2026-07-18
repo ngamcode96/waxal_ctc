@@ -1,0 +1,197 @@
+"""Generate a self-contained Kaggle notebook from the repo source.
+
+The rules say custom packages in a submission notebook won't be accepted, so the
+notebook can't just clone this repo -- it has to carry its own source. Rather
+than maintain a hand-copied duplicate that drifts, we embed the real files as
+%%writefile cells at build time. The repo stays the single source of truth.
+
+    python scripts/build_kaggle_notebook.py
+"""
+
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+OUT = ROOT / "notebooks" / "waxal_kaggle.ipynb"
+
+EMBED = [
+    "src/waxal/__init__.py",
+    "src/waxal/metric.py",
+    "src/waxal/normalize.py",
+    "src/waxal/data.py",
+    "scripts/train_ctc.py",
+    "scripts/infer.py",
+]
+
+
+def md(text: str) -> dict:
+    return {"cell_type": "markdown", "metadata": {}, "source": text.strip().splitlines(True)}
+
+
+def code(text: str) -> dict:
+    return {"cell_type": "code", "execution_count": None, "metadata": {},
+            "outputs": [], "source": text.strip().splitlines(True)}
+
+
+def embed_cell(rel: str) -> dict:
+    body = (ROOT / rel).read_text()
+    return code(f"%%writefile {rel}\n{body}")
+
+
+def build() -> dict:
+    cells: list[dict] = []
+
+    cells.append(md("""
+# WAXAL ASR — w2v-BERT 2.0 CTC
+
+Joint model over Lingala / Luganda / Shona. Self-contained: every source file is
+written to disk by the cells below, so there are no custom package dependencies.
+
+**Phase 1 test labels are public and must not be used.** `waxal.data` refuses to
+load the labeled test split; inference reads the test *audio* with the
+transcription column dropped on load. Phase 1 leaderboard rank carries no signal —
+watch the speaker-disjoint validation score instead.
+
+Settings: **GPU T4 x2** (or P100), and **Internet ON** (the dataset streams from
+Hugging Face).
+"""))
+
+    cells.append(md("## 1. Environment"))
+    cells.append(code("""
+!pip install -q -U "transformers>=4.44" datasets jiwer accelerate soundfile librosa
+
+import os, pathlib
+# /kaggle/working is capped at ~20 GB and the labeled audio is ~12.6 GB; keep the
+# HF cache on the larger scratch volume so extraction doesn't hit the wall.
+os.environ["HF_HOME"] = "/kaggle/temp/hf"
+os.environ["HF_DATASETS_CACHE"] = "/kaggle/temp/hf/datasets"
+pathlib.Path("/kaggle/temp/hf").mkdir(parents=True, exist_ok=True)
+
+!df -h /kaggle/working /kaggle/temp | head -5
+!nvidia-smi --query-gpu=name,memory.total --format=csv
+"""))
+
+    cells.append(md("""
+Optional: a Hugging Face token avoids anonymous rate limits on the ~12.6 GB
+download. Add it under **Add-ons → Secrets** as `HF_TOKEN`. The dataset is public,
+so this only affects speed.
+"""))
+    cells.append(code("""
+try:
+    from kaggle_secrets import UserSecretsClient
+    os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
+    print("HF token loaded")
+except Exception as e:
+    print(f"no HF token ({type(e).__name__}) — continuing anonymously")
+"""))
+
+    cells.append(md("## 2. Source\n\nGenerated from the repo — edit there, not here."))
+    for rel in EMBED:
+        cells.append(embed_cell(rel))
+    cells.append(code("""
+import sys
+sys.path.insert(0, "src")
+from waxal.normalize import clean
+from waxal.metric import score
+assert clean("  Ndaba «x» 12 ⭐️  ") == 'Ndaba "x"'
+print("modules OK")
+"""))
+
+    cells.append(md("""
+## 3. Smoke test
+
+A few hundred rows end-to-end first. The full run costs hours; a typo shouldn't
+cost you one of them. Expect a *terrible* score here — 200 rows trains nothing.
+What matters is that it completes without raising.
+"""))
+    cells.append(code("""
+!python scripts/train_ctc.py \\
+    --output-dir /kaggle/temp/smoke \\
+    --limit 200 --epochs 1 --batch-size 2 --grad-accum 1 \\
+    --valid-frac 0.25 --num-proc 2
+"""))
+
+    cells.append(md("""
+## 4. Full training run
+
+Kaggle sessions are capped at 12 hours (9 for GPU) and the weekly GPU quota is 30
+hours, so this is sized to fit one session rather than to be optimal — treat it as
+a baseline to beat on RunPod, not the final model.
+
+`group_by_length` matters here: these clips vary a lot in duration, and batching
+similar lengths together cuts padding waste substantially.
+"""))
+    cells.append(code("""
+!python scripts/train_ctc.py \\
+    --output-dir /kaggle/working/ctc-v1 \\
+    --epochs 3 --batch-size 8 --grad-accum 4 --lr 5e-5 \\
+    --num-proc 4 --valid-frac 0.06 --seed 42
+"""))
+
+    cells.append(md("""
+## 5. Validation
+
+The honest number. `combined` is the competition metric on **held-out speakers**;
+the per-language breakdown shows which language is dragging — Luganda has the
+least data (5,455 rows vs ~14k each for the others), so expect it to lag.
+"""))
+    cells.append(code("""
+import json, pathlib
+state = json.loads(pathlib.Path("/kaggle/working/ctc-v1/best/trainer_state.json").read_text()) \\
+    if pathlib.Path("/kaggle/working/ctc-v1/best/trainer_state.json").exists() else None
+if state:
+    rows = [h for h in state["log_history"] if "eval_combined" in h]
+    for h in rows[-5:]:
+        per = {k.replace("eval_combined_", ""): round(v, 4)
+               for k, v in h.items() if k.startswith("eval_combined_")}
+        print(f"step {h['step']:>6}  combined {h['eval_combined']:.4f}  "
+              f"wer {h['eval_wer']:.4f}  cer {h['eval_cer']:.4f}  {per}")
+else:
+    print("no trainer_state.json — run training first")
+"""))
+
+    cells.append(md("""
+## 6. Submission
+
+Phase 1 predictions — for format validation and pipeline confidence only. The
+leaderboard score it returns is not meaningful, since others may be submitting
+lookups against the public labels.
+
+When Phase 2 lands (~26 July), switch to `--phase 2 --phase2-dir <path>`.
+"""))
+    cells.append(code("""
+!python scripts/infer.py \\
+    --model /kaggle/working/ctc-v1/best \\
+    --phase 1 \\
+    --sample-submission /kaggle/input/waxal-csvs/SampleSubmission.csv \\
+    --out /kaggle/working/submission.csv \\
+    --batch-size 8
+"""))
+    cells.append(code("""
+import pandas as pd
+sub = pd.read_csv("/kaggle/working/submission.csv", escapechar="\\\\")
+sample = pd.read_csv("/kaggle/input/waxal-csvs/SampleSubmission.csv", escapechar="\\\\")
+assert list(sub.columns) == ["ID", "Target"], sub.columns
+assert len(sub) == len(sample), (len(sub), len(sample))
+assert sub.ID.tolist() == sample.ID.tolist(), "ID order must match SampleSubmission"
+print(f"submission valid — {len(sub):,} rows")
+sub.head()
+"""))
+
+    return {
+        "cells": cells,
+        "metadata": {
+            "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+            "language_info": {"name": "python"},
+            "accelerator": "GPU",
+        },
+        "nbformat": 4,
+        "nbformat_minor": 5,
+    }
+
+
+if __name__ == "__main__":
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    nb = build()
+    OUT.write_text(json.dumps(nb, indent=1, ensure_ascii=False))
+    print(f"wrote {OUT}  ({len(nb['cells'])} cells)")

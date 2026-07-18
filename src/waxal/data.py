@@ -43,6 +43,38 @@ def load_labeled(langs=LANGS, splits=("train", "validation"), num_proc: int = 4)
     return ds.cast_column("audio", datasets.Audio(sampling_rate=SR))
 
 
+def load_test_audio(langs=LANGS, num_proc: int = 4):
+    """Phase 1 test *audio only* -- the transcription column is dropped on load.
+
+    Running our model over the Phase 1 test audio and submitting the predictions
+    is legitimate: it validates the submission format and the inference path.
+    What the rules forbid is using the public ground-truth labels. Dropping the
+    column here means those labels never enter the process at all, so there is
+    no path by which they could leak into a submission.
+    """
+    parts = []
+    for lang in langs:
+        ds = datasets.load_dataset(
+            HF_REPO, data_files={"test": _files(lang, "test")}, split="test",
+            num_proc=num_proc,
+        )
+        parts.append(ds.remove_columns([c for c in ds.column_names
+                                        if c not in ("id", "audio")]))
+    ds = datasets.concatenate_datasets(parts)
+    return ds.cast_column("audio", datasets.Audio(sampling_rate=SR))
+
+
+def load_phase2_audio(path: str, num_proc: int = 4):
+    """Phase 2 evaluation audio, whatever form it arrives in.
+
+    Phase 2 ships no metadata, so this deliberately assumes nothing beyond an id
+    and an audio payload. Adjust the loader once the actual format is published.
+    """
+    ds = datasets.load_dataset("audiofolder", data_dir=path, split="train",
+                               num_proc=num_proc)
+    return ds.cast_column("audio", datasets.Audio(sampling_rate=SR))
+
+
 @dataclass
 class Split:
     train: datasets.Dataset
