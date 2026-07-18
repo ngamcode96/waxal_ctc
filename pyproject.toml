@@ -7,7 +7,13 @@ requires-python = ">=3.10"
 # Core deps stay light so the analysis scripts (profiling, metric, normalization
 # cost) run on a laptop without pulling ~2.5GB of CUDA wheels.
 dependencies = [
-    "datasets>=4.0",
+    # Capped below 4.0 deliberately. datasets 4.x decodes the Audio column through
+    # torchcodec, whose compiled extension is pinned to a specific torch+CUDA ABI
+    # -- on a torch 2.4.1+cu124 image, pip resolves a CUDA 13 build and it fails
+    # with "libnvrtc.so.13: cannot open shared object file". datasets 3.x uses
+    # soundfile instead, which has no such coupling. waxal.data.audio_array()
+    # handles both the 3.x dict and the 4.x AudioDecoder shape, so either works.
+    "datasets>=3.0,<4",
     "huggingface-hub>=0.34",
     "jiwer>=3.0",
     "numpy>=1.26",
@@ -20,10 +26,9 @@ dependencies = [
 # download that can silently land a mismatched build. Use this extra there.
 train = [
     "accelerate>=1.0",
+    # datasets 3.x decodes audio through soundfile -- no torch ABI coupling.
+    "librosa>=0.10",
     "soundfile>=0.12",
-    # datasets >= 4.0 decodes audio through torchcodec; without it, loading the
-    # Audio column raises at the first row rather than at import.
-    "torchcodec>=0.2",
     # transformers 5.x imports DTensor from torch.distributed.tensor, which needs
     # torch >= 2.5. GPU images commonly ship 2.4 (RunPod: 2.4.1+cu124), and
     # upgrading torch there risks the driver/CUDA match. Cap instead -- the code
