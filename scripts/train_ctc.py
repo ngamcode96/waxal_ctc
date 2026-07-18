@@ -69,8 +69,11 @@ class Collator:
         self.p = processor
 
     def __call__(self, features):
+        # Features are cached as float16 to halve disk and read bandwidth;
+        # restore float32 here so the model and padding logic are unaffected.
         audio = self.p.pad(
-            [{"input_features": f["input_features"]} for f in features],
+            [{"input_features": np.asarray(f["input_features"], dtype=np.float32)}
+             for f in features],
             padding=True, return_tensors="pt",
         )
         labels = self.p.tokenizer.pad(
@@ -214,7 +217,11 @@ def prepare(ds, processor, num_proc: int, speeds: tuple[float, ...] = (1.0,),
             arr, sr = wdata.audio_array(row["audio"])
             feats = processor(arr, sampling_rate=sr).input_features[0]
             return {
-                "input_features": feats,
+                # float16 halves the cache (~16GB -> ~8GB) and halves the bytes
+                # read per training step. Training runs in bf16 regardless, and
+                # the collator restores float32 before the model sees it, so
+                # nothing downstream changes.
+                "input_features": np.asarray(feats, dtype=np.float16),
                 "labels": processor.tokenizer(clean(row["transcription"])).input_ids,
                 "language": row["language"],
                 "length": len(feats),
