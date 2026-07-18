@@ -64,8 +64,14 @@ def _files(lang: str, split: str) -> str:
     return f"data/ASR/{lang}/{lang}-{split}-*.parquet"
 
 
-def load_labeled(langs=LANGS, splits=("train", "validation"), num_proc: int = 4):
-    """Load the labeled portion of the target languages. Never touches `test`."""
+def load_labeled(langs=LANGS, splits=("train", "validation"), num_proc: int = 4,
+                 shards: int = 0):
+    """Load the labeled portion of the target languages. Never touches `test`.
+
+    `shards` caps how many parquet files are fetched per language/split. The
+    whole labeled set is ~12.6 GB, so a smoke test that downloads all of it is
+    not a smoke test -- with shards=1 it pulls ~0.5 GB per language instead.
+    """
     if "test" in splits:
         raise ValueError(
             "the HF `test` split is the Phase 1 test set with public labels -- "
@@ -74,8 +80,10 @@ def load_labeled(langs=LANGS, splits=("train", "validation"), num_proc: int = 4)
     parts = []
     for lang in langs:
         for split in splits:
+            files = ([f"data/ASR/{lang}/{lang}-{split}-{i:05d}.parquet"
+                      for i in range(shards)] if shards else _files(lang, split))
             ds = datasets.load_dataset(
-                HF_REPO, data_files={split: _files(lang, split)}, split=split,
+                HF_REPO, data_files={split: files}, split=split,
                 num_proc=num_proc,
             )
             parts.append(ds)

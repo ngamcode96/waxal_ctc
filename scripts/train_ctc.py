@@ -291,9 +291,13 @@ def main() -> None:
         print(f"checkpoints -> huggingface.co/{args.push_to_hub} ({vis})")
 
     print("loading labeled data (train+validation only; test is off-limits)")
-    ds = wdata.load_labeled(num_proc=args.num_proc)
+    # With --limit, fetch one parquet shard per language instead of all ~12.6GB.
+    ds = wdata.load_labeled(num_proc=args.num_proc, shards=1 if args.limit else 0)
     if args.limit:
-        ds = ds.select(range(min(args.limit, len(ds))))
+        # Shuffle first: the shards concatenate language by language, so taking
+        # the head would give an all-Lingala "smoke test" that never exercises
+        # the other two languages or the joint vocabulary.
+        ds = ds.shuffle(seed=args.seed).select(range(min(args.limit, len(ds))))
     print(f"  {len(ds):,} rows")
 
     ds = wdata.filter_usable(ds, min_s=args.min_s, max_s=args.max_s)
