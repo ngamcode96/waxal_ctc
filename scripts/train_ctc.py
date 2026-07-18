@@ -70,6 +70,42 @@ class Collator:
         return audio
 
 
+def make_training_args(**kwargs) -> transformers.TrainingArguments:
+    """Build TrainingArguments, dropping keys this transformers version rejects.
+
+    The argument set churns across releases (v5 removed `group_by_length`, v4.46
+    renamed `evaluation_strategy` to `eval_strategy`). Kaggle, Colab and RunPod
+    will not agree on a version, so filter against the actual signature rather
+    than pinning -- and say out loud what got dropped, since a silently ignored
+    argument is how you end up wondering why training is slow.
+    """
+    import inspect
+
+    sig = inspect.signature(transformers.TrainingArguments.__init__)
+    accepted = set(sig.parameters)
+
+    # Renames, newest name first: try each until one is accepted.
+    aliases = {
+        "eval_strategy": ("eval_strategy", "evaluation_strategy"),
+        "warmup_ratio": ("warmup_ratio",),
+    }
+    resolved, dropped = {}, []
+    for key, value in kwargs.items():
+        for name in aliases.get(key, (key,)):
+            if name in accepted:
+                resolved[name] = value
+                break
+        else:
+            dropped.append(key)
+
+    if dropped:
+        print(f"note: transformers {transformers.__version__} does not accept "
+              f"{dropped} -- proceeding without")
+        if "group_by_length" in dropped:
+            print("      (length grouping off: more padding waste, same accuracy)")
+    return transformers.TrainingArguments(**resolved)
+
+
 def prepare(ds, processor, num_proc: int):
     def fn(batch):
         arr, sr = wdata.audio_array(batch["audio"])
@@ -143,7 +179,7 @@ def main() -> None:
         out.update({f"combined_{l}": v.combined for l, v in per.items()})
         return out
 
-    targs = transformers.TrainingArguments(
+    targs = make_training_args(
         output_dir=str(args.output_dir),
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
