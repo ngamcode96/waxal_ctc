@@ -24,7 +24,11 @@ train = [
     # datasets >= 4.0 decodes audio through torchcodec; without it, loading the
     # Audio column raises at the first row rather than at import.
     "torchcodec>=0.2",
-    "transformers>=4.44",
+    # transformers 5.x imports DTensor from torch.distributed.tensor, which needs
+    # torch >= 2.5. GPU images commonly ship 2.4 (RunPod: 2.4.1+cu124), and
+    # upgrading torch there risks the driver/CUDA match. Cap instead -- the code
+    # adapts to either major version (see make_training_args in train_ctc.py).
+    "transformers>=4.44,<5",
 ]
 
 # Only for a machine with no torch at all. On a GPU image, don't.

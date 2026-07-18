@@ -80,7 +80,16 @@ Verify before going further:
 ```bash
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 python -c "import sys; sys.path.insert(0,'src'); from waxal import hw; print(hw.describe())"
+python -c "import transformers, datasets, torchcodec; print(transformers.__version__, datasets.__version__)"
 ```
+
+**transformers 5.x needs torch >= 2.5** — it imports `DTensor` from
+`torch.distributed.tensor`. RunPod images ship torch 2.4.1, so `pyproject.toml`
+caps transformers below 5. If you see
+`ImportError: cannot import name 'DTensor'`, run `pip install "transformers<5"`.
+Do not upgrade torch to fix it: that is a multi-GB reinstall and risks breaking
+the driver/CUDA match. `torchcodec` is likewise ABI-coupled to torch; if it
+fails to import, pin it to a build matching your torch rather than moving torch.
 
 Expect `True` and `bf16_native=True`. If bf16 shows False on an A100, something
 is wrong with the driver — stop and investigate rather than training 3x slow.
