@@ -180,7 +180,32 @@ def _resample(arr: np.ndarray, factor: float) -> np.ndarray:
     return np.interp(idx, np.arange(len(arr)), arr).astype(np.float32)
 
 
-def prepare(ds, processor, num_proc: int, speeds: tuple[float, ...] = (1.0,)):
+def prepare(ds, processor, num_proc: int, speeds: tuple[float, ...] = (1.0,),
+            writer_batch_size: int = 100):
+    """Extract features. Uses the cheaper non-batched path unless augmenting.
+
+    writer_batch_size matters more than it looks: each feature array is ~480KB,
+    so the datasets default of 1000 buffers ~480MB per worker before flushing.
+    With 16 workers that is ~7.7GB of buffering and very bursty writes -- painful
+    on network storage. 100 keeps the flushes small and steady.
+    """
+    if speeds == (1.0,):
+        # No augmentation: one row in, one row out. Avoids the per-row dict
+        # wrapping that batched=True with batch_size=1 imposes.
+        def fn_single(row):
+            arr, sr = wdata.audio_array(row["audio"])
+            feats = processor(arr, sampling_rate=sr).input_features[0]
+            return {
+                "input_features": feats,
+                "labels": processor.tokenizer(clean(row["transcription"])).input_ids,
+                "language": row["language"],
+                "length": len(feats),
+            }
+
+        return ds.map(fn_single, remove_columns=ds.column_names, num_proc=num_proc,
+                      writer_batch_size=writer_batch_size,
+                      desc="extracting features")
+
     def fn(batch):
         # batched=True with batch_size=1: every field arrives as a 1-element list.
         arr, sr = wdata.audio_array(batch["audio"][0])
@@ -200,6 +225,7 @@ def prepare(ds, processor, num_proc: int, speeds: tuple[float, ...] = (1.0,)):
     # batched with a 1-row batch: lets each input emit len(speeds) output rows.
     return ds.map(fn, remove_columns=ds.column_names, num_proc=num_proc,
                   batched=True, batch_size=1,
+                  writer_batch_size=writer_batch_size,
                   desc=f"extracting features (speeds={list(speeds)})")
 
 
