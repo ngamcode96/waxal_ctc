@@ -18,6 +18,21 @@ def supports_bf16() -> bool:
     return major >= 8
 
 
+def vram_gb() -> float:
+    if not torch.cuda.is_available():
+        return 0.0
+    return torch.cuda.get_device_properties(0).total_memory / 1e9
+
+
+def wants_gradient_checkpointing(threshold_gb: float = 40.0) -> bool:
+    """Checkpointing costs ~35% throughput to save memory.
+
+    Mandatory on a 16GB card (a 580M model at batch 4 OOMs without it) and pure
+    waste on an 80GB A100, so pick from the hardware.
+    """
+    return vram_gb() < threshold_gb
+
+
 def describe() -> str:
     if not torch.cuda.is_available():
         return "cpu"

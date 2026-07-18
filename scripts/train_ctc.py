@@ -289,6 +289,9 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=5e-5)
     ap.add_argument("--num-proc", type=int, default=8,
                     help="workers for feature extraction (CPU-bound; use all cores)")
+    ap.add_argument("--gradient-checkpointing", default=None,
+                    action=argparse.BooleanOptionalAction,
+                    help="default: off when the GPU has >40GB, on otherwise")
     ap.add_argument("--load-proc", type=int, default=1,
                     help="workers for dataset download/Arrow generation. Keep low: "
                          "it is I/O-bound, and high values make datasets' forked "
@@ -332,6 +335,11 @@ def main() -> None:
     args = ap.parse_args()
 
     transformers.set_seed(args.seed)          # rules require reproducibility
+
+    if args.gradient_checkpointing is None:
+        args.gradient_checkpointing = hw.wants_gradient_checkpointing()
+    print(f"{hw.describe()}  vram={hw.vram_gb():.0f}GB  "
+          f"gradient_checkpointing={args.gradient_checkpointing}")
 
     if args.push_to_hub == "auto":
         args.push_to_hub = f"{HUB_USER}/{args.output_dir.name}"
@@ -424,7 +432,10 @@ def main() -> None:
         # bf16 is emulated and much slower than the card's fp16 tensor cores.
         bf16=hw.supports_bf16(),
         fp16=not hw.supports_bf16(),
-        gradient_checkpointing=True,
+        # Checkpointing trades ~35% throughput for memory. It is mandatory on a
+        # 16GB T4 (measured: OOM without it at batch 4) and pure waste on an 80GB
+        # A100, so decide from the card rather than hardcoding the small-GPU case.
+        gradient_checkpointing=args.gradient_checkpointing,
         # Evaluate and save on the same cadence so load_best_model_at_end always
         # has a metric for every checkpoint it might pick.
         eval_strategy=args.save_strategy,
