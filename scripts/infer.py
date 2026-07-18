@@ -26,9 +26,9 @@ def transcribe(ds, model, processor, device, batch_size: int = 8) -> dict[str, s
     out: dict[str, str] = {}
     for start in range(0, len(ds), batch_size):
         rows = ds[start:start + batch_size]
+        arrays = [wdata.audio_array(a)[0] for a in rows["audio"]]
         feats = processor(
-            [a["array"] for a in rows["audio"]],
-            sampling_rate=wdata.SR, return_tensors="pt", padding=True,
+            arrays, sampling_rate=wdata.SR, return_tensors="pt", padding=True,
         ).to(device)
         with torch.autocast(device_type=device.type,
                             dtype=torch.bfloat16, enabled=device.type == "cuda"):

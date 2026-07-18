@@ -72,8 +72,8 @@ class Collator:
 
 def prepare(ds, processor, num_proc: int):
     def fn(batch):
-        a = batch["audio"]
-        feats = processor(a["array"], sampling_rate=wdata.SR).input_features[0]
+        arr, sr = wdata.audio_array(batch["audio"])
+        feats = processor(arr, sampling_rate=sr).input_features[0]
         return {
             "input_features": feats,
             "labels": processor.tokenizer(clean(batch["transcription"])).input_ids,

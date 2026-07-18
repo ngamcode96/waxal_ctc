@@ -14,10 +14,50 @@ Two things this module is careful about:
 from dataclasses import dataclass
 
 import datasets
+import numpy as np
 
 LANGS = ("lin", "lug", "sna")
 HF_REPO = "google/WaxalNLP"
 SR = 16_000
+
+
+# datasets >= 4.0 hands back a torchcodec AudioDecoder instead of the old
+# {"array", "sampling_rate"} dict. Both shapes are handled here so the pipeline
+# doesn't depend on which version the runtime happens to install.
+
+def audio_duration(a) -> float | None:
+    """Duration in seconds, without decoding the waveform where possible."""
+    if isinstance(a, dict):
+        arr, sr = a.get("array"), a.get("sampling_rate")
+        if arr is not None and sr:
+            return len(arr) / sr
+        if a.get("num_samples") and sr:
+            return a["num_samples"] / sr
+        return None
+
+    meta = getattr(a, "metadata", None)
+    for attr in ("duration_seconds", "duration_seconds_from_header"):
+        v = getattr(meta, attr, None)
+        if v:
+            return float(v)
+    frames, sr = getattr(meta, "num_frames", None), getattr(meta, "sample_rate", None)
+    if frames and sr:
+        return frames / sr
+    return None      # unknown -> caller keeps the clip rather than dropping it
+
+
+def audio_array(a) -> tuple[np.ndarray, int]:
+    """Decoded mono waveform and its sample rate."""
+    if isinstance(a, dict):
+        arr = np.asarray(a["array"], dtype=np.float32)
+        sr = a["sampling_rate"]
+    else:
+        samples = a.get_all_samples()
+        arr = samples.data.numpy()
+        sr = int(samples.sample_rate)
+    if arr.ndim > 1:
+        arr = arr.mean(axis=0)      # fold any stereo down to mono
+    return arr.astype(np.float32), sr
 
 
 def _files(lang: str, split: str) -> str:
@@ -126,10 +166,9 @@ def filter_usable(ds, min_s: float = 0.5, max_s: float = 30.0, min_chars: int = 
         txt = clean(row["transcription"] or "")
         if len(txt) < min_chars:
             return False
-        n = row["audio"]["num_samples"] if "num_samples" in row["audio"] else None
-        if n is None:
-            return True
-        dur = n / SR
+        dur = audio_duration(row["audio"])
+        if dur is None:
+            return True      # can't tell cheaply; let the clip through
         if not (min_s <= dur <= max_s):
             return False
         # w2v-BERT downsamples ~2x per 10ms frame -> ~25 frames/sec of output.
