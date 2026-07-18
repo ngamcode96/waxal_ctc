@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+data/
+submissions/*.csv
+!submissions/.gitkeep
+.ipynb_checkpoints/
+*.pt
+*.bin
+*.safetensors
+.DS_Store
