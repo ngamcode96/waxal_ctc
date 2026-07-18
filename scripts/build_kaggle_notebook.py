@@ -132,8 +132,12 @@ both once a single-GPU run is known good.
 similar lengths together cuts padding waste substantially.
 """))
     cells.append(code("""
+# --cache-dir keeps the ~40min feature extraction across retries. /kaggle/temp
+# dies with the session but /kaggle/working is capped at 20GB, and features
+# (~11GB) plus checkpoints (~7GB) would leave no headroom there.
 !CUDA_VISIBLE_DEVICES=0 python scripts/train_ctc.py \\
     --output-dir /kaggle/working/ctc-v1 \\
+    --cache-dir /kaggle/temp/features \\
     --epochs 3 --batch-size 4 --grad-accum 8 --lr 5e-5 \\
     --num-proc 4 --valid-frac 0.06 --seed 42
 """))
@@ -144,6 +148,21 @@ a data problem. T4 can't do bf16, so the fixes are to lower the learning rate to
 works but roughly halves throughput.
 
 **If it OOMs:** drop to `--batch-size 2 --grad-accum 16`.
+"""))
+
+    cells.append(md("""
+## 4b. Where is the time going?
+
+Run this **with training stopped** — it needs the GPU to itself. It times
+forward+backward on synthetic tensors and, if a feature cache exists, the real
+dataloader, then says which one dominates.
+
+A faster GPU only helps the first number. If the dataloader dominates, renting an
+A100 buys nothing.
+"""))
+    cells.append(code("""
+!python scripts/bench.py --batch-size 4 --grad-accum 8 \\
+    --cache-dir /kaggle/temp/features
 """))
 
     cells.append(md("""

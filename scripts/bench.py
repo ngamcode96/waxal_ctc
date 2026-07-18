@@ -106,7 +106,11 @@ def main() -> None:
     print(f"GPU: {torch.cuda.get_device_name(0)}  "
           f"bf16={torch.cuda.is_bf16_supported()}\n")
 
-    if args.cache_dir:
+    have_cache = args.cache_dir and (args.cache_dir / "train").exists()
+    if args.cache_dir and not have_cache:
+        print(f"no feature cache at {args.cache_dir/'train'} -- "
+              "running the GPU benchmark only\n")
+    if have_cache:
         per_batch, lengths = bench_data(args.cache_dir, args.batch_size,
                                         args.workers, 20)
         import statistics
