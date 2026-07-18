@@ -64,13 +64,19 @@ def _files(lang: str, split: str) -> str:
     return f"data/ASR/{lang}/{lang}-{split}-*.parquet"
 
 
-def load_labeled(langs=LANGS, splits=("train", "validation"), num_proc: int = 4,
+def load_labeled(langs=LANGS, splits=("train", "validation"), num_proc: int = 1,
                  shards: int = 0):
     """Load the labeled portion of the target languages. Never touches `test`.
 
     `shards` caps how many parquet files are fetched per language/split. The
     whole labeled set is ~12.6 GB, so a smoke test that downloads all of it is
     not a smoke test -- with shards=1 it pulls ~0.5 GB per language instead.
+
+    `num_proc` defaults to 1 (no multiprocessing) on purpose. Loading is network-
+    and I/O-bound, so extra workers buy little, and a high count relative to the
+    file count makes datasets' forked workers die with "I/O operation on closed
+    file" during Arrow generation. Feature extraction is the CPU-bound stage that
+    actually wants many processes -- that is a separate knob.
     """
     if "test" in splits:
         raise ValueError(
@@ -82,16 +88,19 @@ def load_labeled(langs=LANGS, splits=("train", "validation"), num_proc: int = 4,
         for split in splits:
             files = ([f"data/ASR/{lang}/{lang}-{split}-{i:05d}.parquet"
                       for i in range(shards)] if shards else _files(lang, split))
+            # Never ask for more workers than there are files, and pass None
+            # rather than 1 so datasets skips the multiprocessing path entirely.
+            n = min(num_proc, len(files)) if isinstance(files, list) else num_proc
             ds = datasets.load_dataset(
                 HF_REPO, data_files={split: files}, split=split,
-                num_proc=num_proc,
+                num_proc=n if n and n > 1 else None,
             )
             parts.append(ds)
     ds = datasets.concatenate_datasets(parts)
     return ds.cast_column("audio", datasets.Audio(sampling_rate=SR))
 
 
-def load_test_audio(langs=LANGS, num_proc: int = 4):
+def load_test_audio(langs=LANGS, num_proc: int = 1):
     """Phase 1 test *audio only* -- the transcription column is dropped on load.
 
     Running our model over the Phase 1 test audio and submitting the predictions
@@ -104,7 +113,7 @@ def load_test_audio(langs=LANGS, num_proc: int = 4):
     for lang in langs:
         ds = datasets.load_dataset(
             HF_REPO, data_files={"test": _files(lang, "test")}, split="test",
-            num_proc=num_proc,
+            num_proc=num_proc if num_proc and num_proc > 1 else None,
         )
         parts.append(ds.remove_columns([c for c in ds.column_names
                                         if c not in ("id", "audio")]))
@@ -112,14 +121,15 @@ def load_test_audio(langs=LANGS, num_proc: int = 4):
     return ds.cast_column("audio", datasets.Audio(sampling_rate=SR))
 
 
-def load_phase2_audio(path: str, num_proc: int = 4):
+def load_phase2_audio(path: str, num_proc: int = 1):
     """Phase 2 evaluation audio, whatever form it arrives in.
 
     Phase 2 ships no metadata, so this deliberately assumes nothing beyond an id
     and an audio payload. Adjust the loader once the actual format is published.
     """
-    ds = datasets.load_dataset("audiofolder", data_dir=path, split="train",
-                               num_proc=num_proc)
+    ds = datasets.load_dataset(
+        "audiofolder", data_dir=path, split="train",
+        num_proc=num_proc if num_proc and num_proc > 1 else None)
     return ds.cast_column("audio", datasets.Audio(sampling_rate=SR))
 
 

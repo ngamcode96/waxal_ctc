@@ -243,7 +243,12 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--grad-accum", type=int, default=4)
     ap.add_argument("--lr", type=float, default=5e-5)
-    ap.add_argument("--num-proc", type=int, default=8)
+    ap.add_argument("--num-proc", type=int, default=8,
+                    help="workers for feature extraction (CPU-bound; use all cores)")
+    ap.add_argument("--load-proc", type=int, default=1,
+                    help="workers for dataset download/Arrow generation. Keep low: "
+                         "it is I/O-bound, and high values make datasets' forked "
+                         "workers fail with 'I/O operation on closed file'")
     ap.add_argument("--valid-frac", type=float, default=0.06)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--limit", type=int, default=0, help="debug: cap rows loaded")
@@ -292,7 +297,7 @@ def main() -> None:
 
     print("loading labeled data (train+validation only; test is off-limits)")
     # With --limit, fetch one parquet shard per language instead of all ~12.6GB.
-    ds = wdata.load_labeled(num_proc=args.num_proc, shards=1 if args.limit else 0)
+    ds = wdata.load_labeled(num_proc=args.load_proc, shards=1 if args.limit else 0)
     if args.limit:
         # Shuffle first: the shards concatenate language by language, so taking
         # the head would give an all-Lingala "smoke test" that never exercises

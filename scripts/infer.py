@@ -49,7 +49,8 @@ def main() -> None:
                     default=Path("data/raw/SampleSubmission.csv"))
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--batch-size", type=int, default=8)
-    ap.add_argument("--num-proc", type=int, default=4)
+    ap.add_argument("--num-proc", type=int, default=1,
+                    help="dataset loading workers; keep low (see train_ctc.py)")
     args = ap.parse_args()
 
     processor = transformers.Wav2Vec2BertProcessor.from_pretrained(str(args.model))
