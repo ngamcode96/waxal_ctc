@@ -16,8 +16,20 @@ Run:
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
+
+# Must precede the torch/numpy imports: they read these at import time.
+#
+# Feature extraction runs N worker processes, and each would otherwise start
+# torch/OpenMP with one thread per core. With 8 workers on 16 cores that is ~128
+# threads competing for 16 cores, and throughput stops responding to --num-proc
+# at all (measured: 8.86 ex/s at 16 workers, 8.46 at 8). One thread per worker
+# lets the process count actually do the parallelism.
+for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -189,6 +201,12 @@ def prepare(ds, processor, num_proc: int, speeds: tuple[float, ...] = (1.0,),
     With 16 workers that is ~7.7GB of buffering and very bursty writes -- painful
     on network storage. 100 keeps the flushes small and steady.
     """
+    # Belt and braces: the env vars above cover libraries that read them at
+    # import, this covers torch regardless of import order. Forked workers
+    # inherit it. GPU training does not need CPU threads, so leaving it at 1
+    # costs nothing later.
+    torch.set_num_threads(1)
+
     if speeds == (1.0,):
         # No augmentation: one row in, one row out. Avoids the per-row dict
         # wrapping that batched=True with batch_size=1 imposes.
