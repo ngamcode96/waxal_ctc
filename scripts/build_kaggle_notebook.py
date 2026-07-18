@@ -118,14 +118,32 @@ Kaggle sessions are capped at 12 hours (9 for GPU) and the weekly GPU quota is 3
 hours, so this is sized to fit one session rather than to be optimal — treat it as
 a baseline to beat on RunPod, not the final model.
 
+Sized for a **T4 (15 GB, no bf16)**: batch 4 with 8 accumulation steps holds the
+effective batch at 32 while keeping activations inside memory. A 580M model in
+mixed precision spends ~10 GB on weights, the fp32 master copy, and AdamW moments
+before a single activation is stored.
+
+`CUDA_VISIBLE_DEVICES=0` pins this to one GPU on purpose. With both visible, the
+Trainer silently switches to DataParallel, which changes the effective batch size
+and adds a failure mode to debug on the first real run. Drop the prefix to use
+both once a single-GPU run is known good.
+
 `group_by_length` matters here: these clips vary a lot in duration, and batching
 similar lengths together cuts padding waste substantially.
 """))
     cells.append(code("""
-!python scripts/train_ctc.py \\
+!CUDA_VISIBLE_DEVICES=0 python scripts/train_ctc.py \\
     --output-dir /kaggle/working/ctc-v1 \\
-    --epochs 3 --batch-size 8 --grad-accum 4 --lr 5e-5 \\
+    --epochs 3 --batch-size 4 --grad-accum 8 --lr 5e-5 \\
     --num-proc 4 --valid-frac 0.06 --seed 42
+"""))
+    cells.append(md("""
+**If loss goes `nan` and stays there:** that's fp16 underflow in the CTC loss, not
+a data problem. T4 can't do bf16, so the fixes are to lower the learning rate to
+`3e-5`, or raise warmup to `--warmup-ratio 0.2`. If it persists, training in fp32
+works but roughly halves throughput.
+
+**If it OOMs:** drop to `--batch-size 2 --grad-accum 16`.
 """))
 
     cells.append(md("""
