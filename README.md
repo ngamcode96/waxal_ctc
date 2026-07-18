@@ -12,12 +12,21 @@ uv venv --python 3.11
 uv pip install -e .
 ```
 
-RunPod / any GPU box:
+RunPod / any GPU image (torch already present — do **not** reinstall it):
 
 ```bash
-uv venv --python 3.11
-uv pip install -e ".[train]"
+uv pip install --system -e ".[train]"
 ```
+
+No virtualenv: the pod is disposable, and its torch is built against the
+image's driver and CUDA. The `train` extra deliberately omits torch so this
+never clobbers it. Verify before training:
+
+```bash
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
+A machine with no torch at all (rare) needs `".[train,torch]"`.
 
 ## Training
 

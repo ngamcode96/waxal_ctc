@@ -15,16 +15,20 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Everything needed to actually train or run inference. Install this on RunPod.
+# Training deps EXCLUDING torch. GPU images (RunPod, Colab, Kaggle) ship a torch
+# built against their own driver/CUDA; reinstalling it from PyPI is a multi-GB
+# download that can silently land a mismatched build. Use this extra there.
 train = [
     "accelerate>=1.0",
     "soundfile>=0.12",
     # datasets >= 4.0 decodes audio through torchcodec; without it, loading the
     # Audio column raises at the first row rather than at import.
     "torchcodec>=0.2",
-    "torch>=2.4",
     "transformers>=4.44",
 ]
+
+# Only for a machine with no torch at all. On a GPU image, don't.
+torch = ["torch>=2.4"]
 
 [build-system]
 requires = ["hatchling"]
