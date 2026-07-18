@@ -21,10 +21,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+import datasets
 import numpy as np
 import torch
 import transformers
-from torch.utils.data import DataLoader
 
 from waxal import data as wdata
 from waxal.metric import score, score_by_language
@@ -177,6 +177,39 @@ def prepare(ds, processor, num_proc: int):
                   desc="extracting features")
 
 
+def prepare_cached(ds, processor, num_proc: int, cache_dir: Path | None, tag: str,
+                   key: dict):
+    """Feature extraction with an explicit on-disk cache.
+
+    datasets.map caches by fingerprint, but the fingerprint hashes the mapped
+    function *and its closure* -- which here includes the processor. Any edit to
+    this file, or an unstable hash of the processor, silently invalidates it and
+    you pay full extraction again. At ~40 minutes a run that is too expensive to
+    leave to chance, so we save explicitly and validate against the parameters
+    that actually affect the output.
+    """
+    if cache_dir is None:
+        return prepare(ds, processor, num_proc)
+
+    path = cache_dir / tag
+    manifest = cache_dir / f"{tag}.json"
+    if path.exists() and manifest.exists():
+        stored = json.loads(manifest.read_text())
+        if stored == key:
+            print(f"reusing cached features: {path}")
+            return datasets.load_from_disk(str(path))
+        # Stale cache is worse than none -- it trains on the wrong thing silently.
+        print(f"cache at {path} was built with different settings, rebuilding")
+        print(f"  cached: {stored}\n  wanted: {key}")
+
+    out = prepare(ds, processor, num_proc)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out.save_to_disk(str(path))
+    manifest.write_text(json.dumps(key, indent=1, sort_keys=True))
+    print(f"cached features -> {path}")
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--output-dir", type=Path, required=True)
@@ -188,6 +221,9 @@ def main() -> None:
     ap.add_argument("--valid-frac", type=float, default=0.06)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--limit", type=int, default=0, help="debug: cap rows loaded")
+    ap.add_argument("--cache-dir", type=Path, default=None,
+                    help="persist extracted features here so a failed run doesn't "
+                         "repeat the ~40min extraction; put it on a persistent volume")
     args = ap.parse_args()
 
     transformers.set_seed(args.seed)          # rules require reproducibility
@@ -209,8 +245,18 @@ def main() -> None:
     fe = transformers.AutoFeatureExtractor.from_pretrained(MODEL_ID)
     processor = transformers.Wav2Vec2BertProcessor(feature_extractor=fe, tokenizer=tokenizer)
 
-    train_ds = prepare(split.train, processor, args.num_proc)
-    valid_ds = prepare(split.valid, processor, args.num_proc)
+    # Everything that changes the extracted features or which rows they cover.
+    # The learning rate and epoch count deliberately aren't here -- they don't
+    # affect features, so re-tuning them should reuse the cache.
+    key = {
+        "model": MODEL_ID, "langs": list(wdata.LANGS), "sr": wdata.SR,
+        "valid_frac": args.valid_frac, "seed": args.seed, "limit": args.limit,
+        "vocab": sorted(processor.tokenizer.get_vocab()),
+    }
+    train_ds = prepare_cached(split.train, processor, args.num_proc,
+                              args.cache_dir, "train", key)
+    valid_ds = prepare_cached(split.valid, processor, args.num_proc,
+                              args.cache_dir, "valid", key)
     valid_langs = valid_ds["language"]
     valid_refs = [clean(t) for t in split.valid["transcription"]]
 
