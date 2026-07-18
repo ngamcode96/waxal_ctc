@@ -163,23 +163,47 @@ def make_training_args(**kwargs) -> transformers.TrainingArguments:
     return transformers.TrainingArguments(**resolved)
 
 
-def prepare(ds, processor, num_proc: int):
+def _resample(arr: np.ndarray, factor: float) -> np.ndarray:
+    """Speed up (factor>1) or slow down the waveform, shifting pitch with it.
+
+    Resampling without correcting pitch is deliberate -- it is the classic Kaldi
+    speed-perturb recipe, and the pitch shift is what makes it act like extra
+    speakers rather than just extra tempo. That is what Phase 2 tests.
+    """
+    if factor == 1.0:
+        return arr
+    n = int(round(len(arr) / factor))
+    # Linear interpolation onto the resampled grid; good enough for augmentation
+    # and avoids a scipy/librosa dependency in the hot path.
+    idx = np.linspace(0, len(arr) - 1, n)
+    return np.interp(idx, np.arange(len(arr)), arr).astype(np.float32)
+
+
+def prepare(ds, processor, num_proc: int, speeds: tuple[float, ...] = (1.0,)):
     def fn(batch):
-        arr, sr = wdata.audio_array(batch["audio"])
-        feats = processor(arr, sampling_rate=sr).input_features[0]
+        # batched=True with batch_size=1: every field arrives as a 1-element list.
+        arr, sr = wdata.audio_array(batch["audio"][0])
+        labels = processor.tokenizer(clean(batch["transcription"][0])).input_ids
+        feats, lens = [], []
+        for f in speeds:
+            x = processor(_resample(arr, f), sampling_rate=sr).input_features[0]
+            feats.append(x)
+            lens.append(len(x))
         return {
             "input_features": feats,
-            "labels": processor.tokenizer(clean(batch["transcription"])).input_ids,
-            "language": batch["language"],
-            "length": len(feats),      # drives LengthGroupedSampler
+            "labels": [labels] * len(speeds),      # transcript is unchanged
+            "language": [batch["language"][0]] * len(speeds),
+            "length": lens,                        # drives LengthGroupedSampler
         }
 
+    # batched with a 1-row batch: lets each input emit len(speeds) output rows.
     return ds.map(fn, remove_columns=ds.column_names, num_proc=num_proc,
-                  desc="extracting features")
+                  batched=True, batch_size=1,
+                  desc=f"extracting features (speeds={list(speeds)})")
 
 
 def prepare_cached(ds, processor, num_proc: int, cache_dir: Path | None, tag: str,
-                   key: dict):
+                   key: dict, speeds: tuple[float, ...] = (1.0,)):
     """Feature extraction with an explicit on-disk cache.
 
     datasets.map caches by fingerprint, but the fingerprint hashes the mapped
@@ -190,7 +214,7 @@ def prepare_cached(ds, processor, num_proc: int, cache_dir: Path | None, tag: st
     that actually affect the output.
     """
     if cache_dir is None:
-        return prepare(ds, processor, num_proc)
+        return prepare(ds, processor, num_proc, speeds)
 
     path = cache_dir / tag
     manifest = cache_dir / f"{tag}.json"
@@ -203,7 +227,7 @@ def prepare_cached(ds, processor, num_proc: int, cache_dir: Path | None, tag: st
         print(f"cache at {path} was built with different settings, rebuilding")
         print(f"  cached: {stored}\n  wanted: {key}")
 
-    out = prepare(ds, processor, num_proc)
+    out = prepare(ds, processor, num_proc, speeds)
     path.parent.mkdir(parents=True, exist_ok=True)
     out.save_to_disk(str(path))
     manifest.write_text(json.dumps(key, indent=1, sort_keys=True))
@@ -237,6 +261,19 @@ def main() -> None:
                          "forbid sharing work outside your team during the challenge")
     ap.add_argument("--resume", action="store_true",
                     help="resume from the last checkpoint in --output-dir")
+    # SpecAugment. Applied inside the model at training time only, so it costs
+    # nothing extra and does NOT invalidate the feature cache -- tune these freely.
+    ap.add_argument("--mask-time-prob", type=float, default=0.05,
+                    help="fraction of time steps masked (0.05-0.10 typical)")
+    ap.add_argument("--mask-time-length", type=int, default=10)
+    ap.add_argument("--mask-feature-prob", type=float, default=0.0,
+                    help="frequency masking; 0.01-0.05 helps on unseen speakers")
+    ap.add_argument("--mask-feature-length", type=int, default=64)
+    # Speed perturbation. Changes the audio, so it DOES invalidate the cache and
+    # multiplies extraction time and disk by len(factors).
+    ap.add_argument("--speed-perturb", type=str, default="",
+                    help="comma-separated factors, e.g. 0.9,1.0,1.1 -- triples the "
+                         "training set with faster/slower copies")
     args = ap.parse_args()
 
     transformers.set_seed(args.seed)          # rules require reproducibility
@@ -261,15 +298,25 @@ def main() -> None:
     # Everything that changes the extracted features or which rows they cover.
     # The learning rate and epoch count deliberately aren't here -- they don't
     # affect features, so re-tuning them should reuse the cache.
+    speeds = tuple(float(s) for s in args.speed_perturb.split(",")) \
+        if args.speed_perturb else (1.0,)
+
     key = {
         "model": MODEL_ID, "langs": list(wdata.LANGS), "sr": wdata.SR,
         "valid_frac": args.valid_frac, "seed": args.seed, "limit": args.limit,
         "vocab": sorted(processor.tokenizer.get_vocab()),
     }
+    # Augment training only. A perturbed validation set would measure the model
+    # on audio the Phase 2 set will never contain, and would not be comparable
+    # to the un-augmented baseline.
     train_ds = prepare_cached(split.train, processor, args.num_proc,
-                              args.cache_dir, "train", key)
+                              args.cache_dir, "train",
+                              {**key, "speeds": list(speeds)}, speeds)
     valid_ds = prepare_cached(split.valid, processor, args.num_proc,
                               args.cache_dir, "valid", key)
+    if speeds != (1.0,):
+        print(f"speed perturbation {list(speeds)}: train {len(split.train):,} "
+              f"-> {len(train_ds):,} rows")
     valid_langs = valid_ds["language"]
     valid_refs = [clean(t) for t in split.valid["transcription"]]
 
@@ -278,7 +325,10 @@ def main() -> None:
         attention_dropout=0.0, hidden_dropout=0.0, feat_proj_dropout=0.0,
         # SpecAugment-style masking is the main regularizer here; the labeled
         # set is small relative to the 580M encoder.
-        mask_time_prob=0.05, mask_time_length=10,
+        mask_time_prob=args.mask_time_prob,
+        mask_time_length=args.mask_time_length,
+        mask_feature_prob=args.mask_feature_prob,
+        mask_feature_length=args.mask_feature_length,
         layerdrop=0.0,
         ctc_loss_reduction="mean",
         add_adapter=True,
