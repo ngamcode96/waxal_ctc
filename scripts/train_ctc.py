@@ -246,6 +246,10 @@ def main() -> None:
     ap.add_argument("--valid-frac", type=float, default=0.06)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--limit", type=int, default=0, help="debug: cap rows loaded")
+    ap.add_argument("--max-s", type=float, default=30.0,
+                    help="drop clips longer than this. Attention is quadratic in "
+                         "length, so a few long clips cost disproportionately")
+    ap.add_argument("--min-s", type=float, default=0.5)
     ap.add_argument("--cache-dir", type=Path, default=None,
                     help="persist extracted features here so a failed run doesn't "
                          "repeat the ~40min extraction; put it on a persistent volume")
@@ -284,8 +288,8 @@ def main() -> None:
         ds = ds.select(range(min(args.limit, len(ds))))
     print(f"  {len(ds):,} rows")
 
-    ds = wdata.filter_usable(ds)
-    print(f"  {len(ds):,} usable")
+    ds = wdata.filter_usable(ds, min_s=args.min_s, max_s=args.max_s)
+    print(f"  {len(ds):,} usable (clips {args.min_s}-{args.max_s}s)")
 
     print("building speaker-disjoint validation split")
     split = wdata.speaker_disjoint_split(ds, args.valid_frac, args.seed)
@@ -304,6 +308,7 @@ def main() -> None:
     key = {
         "model": MODEL_ID, "langs": list(wdata.LANGS), "sr": wdata.SR,
         "valid_frac": args.valid_frac, "seed": args.seed, "limit": args.limit,
+        "min_s": args.min_s, "max_s": args.max_s,   # change which rows survive
         "vocab": sorted(processor.tokenizer.get_vocab()),
     }
     # Augment training only. A perturbed validation set would measure the model
