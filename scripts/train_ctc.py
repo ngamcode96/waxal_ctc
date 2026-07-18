@@ -224,6 +224,18 @@ def main() -> None:
     ap.add_argument("--cache-dir", type=Path, default=None,
                     help="persist extracted features here so a failed run doesn't "
                          "repeat the ~40min extraction; put it on a persistent volume")
+    ap.add_argument("--save-strategy", choices=("steps", "epoch"), default="epoch",
+                    help="epoch: one checkpoint per epoch (default)")
+    ap.add_argument("--save-steps", type=int, default=500,
+                    help="only used with --save-strategy steps")
+    ap.add_argument("--push-to-hub", type=str, default="",
+                    help="HF repo id, e.g. ngam/waxal-ctc-v1. Checkpoints upload "
+                         "as they are saved, surviving pod loss")
+    ap.add_argument("--hub-public", action="store_true",
+                    help="publish the Hub repo publicly. Off by default: the rules "
+                         "forbid sharing work outside your team during the challenge")
+    ap.add_argument("--resume", action="store_true",
+                    help="resume from the last checkpoint in --output-dir")
     args = ap.parse_args()
 
     transformers.set_seed(args.seed)          # rules require reproducibility
@@ -294,9 +306,12 @@ def main() -> None:
         bf16=torch.cuda.is_bf16_supported(),
         fp16=not torch.cuda.is_bf16_supported(),
         gradient_checkpointing=True,
-        eval_strategy="steps",
-        eval_steps=500,
-        save_steps=500,
+        # Evaluate and save on the same cadence so load_best_model_at_end always
+        # has a metric for every checkpoint it might pick.
+        eval_strategy=args.save_strategy,
+        save_strategy=args.save_strategy,
+        **({"eval_steps": args.save_steps, "save_steps": args.save_steps}
+           if args.save_strategy == "steps" else {}),
         logging_steps=50,
         save_total_limit=3,
         load_best_model_at_end=True,
@@ -308,6 +323,12 @@ def main() -> None:
         dataloader_num_workers=4,
         seed=args.seed,
         report_to=[],
+        # "every_save" uploads each checkpoint as it is written, so a pod that
+        # dies mid-run costs one epoch rather than the whole run.
+        **({"push_to_hub": True,
+            "hub_model_id": args.push_to_hub,
+            "hub_strategy": "every_save",
+            "hub_private_repo": not args.hub_public} if args.push_to_hub else {}),
     )
 
     trainer = LengthGroupedTrainer(
@@ -316,10 +337,29 @@ def main() -> None:
         data_collator=Collator(processor),
         compute_metrics=compute_metrics,
     )
-    trainer.train()
-    trainer.save_model(str(args.output_dir / "best"))
-    processor.save_pretrained(str(args.output_dir / "best"))
-    print(f"saved -> {args.output_dir/'best'}")
+    resume = None
+    if args.resume:
+        last = transformers.trainer_utils.get_last_checkpoint(str(args.output_dir))
+        if last:
+            print(f"resuming from {last}")
+            resume = last
+        else:
+            print(f"--resume given but no checkpoint in {args.output_dir}; "
+                  "starting fresh")
+
+    trainer.train(resume_from_checkpoint=resume)
+
+    best = args.output_dir / "best"
+    trainer.save_model(str(best))
+    processor.save_pretrained(str(best))
+    print(f"saved -> {best}")
+
+    if args.push_to_hub:
+        # The per-checkpoint uploads carry model weights but not the processor;
+        # without it the repo can't tokenize or extract features on its own.
+        processor.push_to_hub(args.push_to_hub, private=not args.hub_public)
+        trainer.push_to_hub(commit_message="final best checkpoint")
+        print(f"pushed -> https://huggingface.co/{args.push_to_hub}")
 
 
 if __name__ == "__main__":
