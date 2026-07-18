@@ -22,12 +22,19 @@ uv pip install -e ".[train]"
 ## Training
 
 ```bash
+export HF_TOKEN=hf_...        # needs write permission
 python scripts/train_ctc.py \
     --output-dir /workspace/ctc-v1 \
     --cache-dir /workspace/cache \
-    --push-to-hub <user>/waxal-ctc-v1 \
+    --push-to-hub \
     --epochs 5 --batch-size 16 --grad-accum 2 --lr 5e-5 --num-proc 16
 ```
+
+The bare `--push-to-hub` flag uploads each checkpoint to
+`ngia/<output-dir-name>` — so the command above pushes to `ngia/ctc-v1`, and
+naming the output dir after the experiment keeps runs separate. Repos are
+created **private**; the rules forbid sharing work outside your team during the
+challenge. Pass a value to override the repo, or `--hub-public` to publish.
 
 `--cache-dir` persists the ~40 minute feature extraction across runs. Put it on a
 volume that survives the pod. Add `--resume` to continue from the last checkpoint.

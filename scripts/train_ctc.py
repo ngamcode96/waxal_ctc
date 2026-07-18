@@ -32,6 +32,7 @@ from waxal.metric import score, score_by_language
 from waxal.normalize import clean
 
 MODEL_ID = "facebook/w2v-bert-2.0"
+HUB_USER = "ngia"
 
 
 def build_tokenizer(texts: list[str], out_dir: Path) -> transformers.Wav2Vec2CTCTokenizer:
@@ -257,9 +258,10 @@ def main() -> None:
                     help="epoch: one checkpoint per epoch (default)")
     ap.add_argument("--save-steps", type=int, default=500,
                     help="only used with --save-strategy steps")
-    ap.add_argument("--push-to-hub", type=str, default="",
-                    help="HF repo id, e.g. ngam/waxal-ctc-v1. Checkpoints upload "
-                         "as they are saved, surviving pod loss")
+    ap.add_argument("--push-to-hub", type=str, nargs="?", const="auto", default="",
+                    help=f"upload checkpoints as they are saved, surviving pod "
+                         f"loss. Bare flag uses {HUB_USER}/<output-dir-name>; pass "
+                         f"a value to override, e.g. {HUB_USER}/waxal-ctc-v1")
     ap.add_argument("--hub-public", action="store_true",
                     help="publish the Hub repo publicly. Off by default: the rules "
                          "forbid sharing work outside your team during the challenge")
@@ -281,6 +283,12 @@ def main() -> None:
     args = ap.parse_args()
 
     transformers.set_seed(args.seed)          # rules require reproducibility
+
+    if args.push_to_hub == "auto":
+        args.push_to_hub = f"{HUB_USER}/{args.output_dir.name}"
+    if args.push_to_hub:
+        vis = "public" if args.hub_public else "private"
+        print(f"checkpoints -> huggingface.co/{args.push_to_hub} ({vis})")
 
     print("loading labeled data (train+validation only; test is off-limits)")
     ds = wdata.load_labeled(num_proc=args.num_proc)
