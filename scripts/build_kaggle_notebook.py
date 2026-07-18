@@ -18,9 +18,11 @@ EMBED = [
     "src/waxal/__init__.py",
     "src/waxal/metric.py",
     "src/waxal/normalize.py",
+    "src/waxal/hw.py",
     "src/waxal/data.py",
     "scripts/train_ctc.py",
     "scripts/infer.py",
+    "scripts/bench.py",
 ]
 
 

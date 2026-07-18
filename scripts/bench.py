@@ -23,11 +23,13 @@ import datasets
 import torch
 import transformers
 
+from waxal import hw
+
 MODEL_ID = "facebook/w2v-bert-2.0"
 
 
 def bench_gpu(batch_size: int, frames: int, vocab: int, steps: int,
-              checkpointing: bool) -> float:
+              checkpointing: bool, dtype: torch.dtype) -> float:
     """Seconds per optimizer step, synthetic data, nothing else in the way."""
     dev = torch.device("cuda")
     model = transformers.Wav2Vec2BertForCTC.from_pretrained(
@@ -39,7 +41,7 @@ def bench_gpu(batch_size: int, frames: int, vocab: int, steps: int,
     model.train()
 
     opt = torch.optim.AdamW(model.parameters(), lr=1e-5)
-    amp = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    amp = dtype
     scaler = torch.amp.GradScaler(enabled=amp == torch.float16)
 
     x = torch.randn(batch_size, frames, 160, device=dev)
@@ -103,8 +105,7 @@ def main() -> None:
     if not torch.cuda.is_available():
         print("no GPU visible")
         return
-    print(f"GPU: {torch.cuda.get_device_name(0)}  "
-          f"bf16={torch.cuda.is_bf16_supported()}\n")
+    print(f"GPU: {hw.describe()}\n")
 
     have_cache = args.cache_dir and (args.cache_dir / "train").exists()
     if args.cache_dir and not have_cache:
@@ -126,11 +127,21 @@ def main() -> None:
         data_step, frames = 0.0, 750
         print("(no --cache-dir: skipping data benchmark)\n")
 
-    for ckpt in (True, False):
-        s = bench_gpu(args.batch_size, frames, args.vocab, args.steps, ckpt)
-        total = s * args.grad_accum
-        print(f"gpu only (checkpointing={str(ckpt):5s}): {s:.3f}s/microbatch "
-              f"-> {total:.1f}s per optimizer step")
+    total = 0.0
+    for dtype, label in ((torch.float16, "fp16"), (torch.bfloat16, "bf16")):
+        for ckpt in (True, False):
+            try:
+                s = bench_gpu(args.batch_size, frames, args.vocab, args.steps,
+                              ckpt, dtype)
+                total = s * args.grad_accum
+                print(f"gpu {label} checkpointing={str(ckpt):5s}: "
+                      f"{s:.3f}s/microbatch -> {total:.1f}s per optimizer step")
+            except torch.OutOfMemoryError:
+                # Expected without checkpointing on a small card; not a failure.
+                print(f"gpu {label} checkpointing={str(ckpt):5s}: OOM at "
+                      f"batch {args.batch_size} x {frames} frames")
+            finally:
+                torch.cuda.empty_cache()
 
     if data_step:
         print(f"\nverdict: data {data_step:.1f}s vs gpu {total:.1f}s per step -> "

@@ -27,6 +27,7 @@ import torch
 import transformers
 
 from waxal import data as wdata
+from waxal import hw
 from waxal.metric import score, score_by_language
 from waxal.normalize import clean
 
@@ -303,8 +304,10 @@ def main() -> None:
         learning_rate=args.lr,
         warmup_ratio=0.1,
         lr_scheduler_type="linear",
-        bf16=torch.cuda.is_bf16_supported(),
-        fp16=not torch.cuda.is_bf16_supported(),
+        # NOT torch.cuda.is_bf16_supported(): that reports True on a T4, where
+        # bf16 is emulated and much slower than the card's fp16 tensor cores.
+        bf16=hw.supports_bf16(),
+        fp16=not hw.supports_bf16(),
         gradient_checkpointing=True,
         # Evaluate and save on the same cadence so load_best_model_at_end always
         # has a metric for every checkpoint it might pick.
