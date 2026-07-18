@@ -70,6 +70,62 @@ class Collator:
         return audio
 
 
+class LengthGroupedSampler(torch.utils.data.Sampler):
+    """Batch clips of similar duration together.
+
+    transformers 5.x dropped `group_by_length`, and without it every batch is
+    padded to its longest member -- with clips ranging from 0.5s to 30s that is a
+    large fraction of the compute spent on padding. Shuffle, cut into megabatches,
+    sort each by length, then shuffle the batch order: near-uniform batches while
+    keeping enough randomness that the model doesn't see the same grouping twice.
+    """
+
+    def __init__(self, lengths: list[int], batch_size: int, seed: int = 42,
+                 megabatch_mult: int = 50):
+        self.lengths = lengths
+        self.batch_size = batch_size
+        self.megabatch_size = batch_size * megabatch_mult
+        self.seed = seed
+        self.epoch = 0
+
+    def __len__(self) -> int:
+        return len(self.lengths)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch      # reshuffles grouping each epoch
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        indices = torch.randperm(len(self.lengths), generator=g).tolist()
+
+        megabatches = [indices[i:i + self.megabatch_size]
+                       for i in range(0, len(indices), self.megabatch_size)]
+        # Longest-first inside each megabatch surfaces the worst-case batch early,
+        # so an OOM shows up in the first minute rather than an hour in.
+        megabatches = [sorted(mb, key=lambda i: self.lengths[i], reverse=True)
+                       for mb in megabatches]
+
+        batches = [mb[i:i + self.batch_size]
+                   for mb in megabatches
+                   for i in range(0, len(mb), self.batch_size)]
+        order = torch.randperm(len(batches), generator=g).tolist()
+        for b in order:
+            yield from batches[b]
+
+
+class LengthGroupedTrainer(transformers.Trainer):
+    """Trainer that uses LengthGroupedSampler when the dataset carries lengths."""
+
+    def _get_train_sampler(self, *args, **kwargs):
+        ds = self.train_dataset
+        if ds is None or "length" not in getattr(ds, "column_names", []):
+            return super()._get_train_sampler(*args, **kwargs)
+        return LengthGroupedSampler(
+            ds["length"], self.args.per_device_train_batch_size, self.args.seed
+        )
+
+
 def make_training_args(**kwargs) -> transformers.TrainingArguments:
     """Build TrainingArguments, dropping keys this transformers version rejects.
 
@@ -114,6 +170,7 @@ def prepare(ds, processor, num_proc: int):
             "input_features": feats,
             "labels": processor.tokenizer(clean(batch["transcription"])).input_ids,
             "language": batch["language"],
+            "length": len(feats),      # drives LengthGroupedSampler
         }
 
     return ds.map(fn, remove_columns=ds.column_names, num_proc=num_proc,
@@ -199,13 +256,15 @@ def main() -> None:
         load_best_model_at_end=True,
         metric_for_best_model="combined",
         greater_is_better=False,          # lower WER/CER wins
-        group_by_length=True,             # big throughput win on variable-length audio
+        # We group by length ourselves (LengthGroupedTrainer); keep the extra
+        # columns it needs, since the collator already selects what the model sees.
+        remove_unused_columns=False,
         dataloader_num_workers=4,
         seed=args.seed,
         report_to=[],
     )
 
-    trainer = transformers.Trainer(
+    trainer = LengthGroupedTrainer(
         model=model, args=targs,
         train_dataset=train_ds, eval_dataset=valid_ds,
         data_collator=Collator(processor),
