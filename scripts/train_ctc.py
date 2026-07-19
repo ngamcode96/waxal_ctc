@@ -311,7 +311,10 @@ def prepare_cached(ds, processor, num_proc: int, cache_dir: Path | None, tag: st
 
     out = prepare(ds, processor, num_proc, speeds)
     path.parent.mkdir(parents=True, exist_ok=True)
-    out.save_to_disk(str(path))
+    # Default sharding writes ~21 files for this dataset. Networked filesystems
+    # (RunPod's MooseFS) fail with Errno 5 partway through that; fewer, larger
+    # writes are more likely to survive. Local disks do not care either way.
+    out.save_to_disk(str(path), max_shard_size="2GB")
     manifest.write_text(json.dumps(key, indent=1, sort_keys=True))
     print(f"cached features -> {path}")
     return out
