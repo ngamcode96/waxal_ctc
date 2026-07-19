@@ -52,12 +52,17 @@ MODEL_ID = "facebook/w2v-bert-2.0"
 HUB_USER = "ngia"
 
 
-def build_tokenizer(texts: list[str], out_dir: Path) -> transformers.Wav2Vec2CTCTokenizer:
+def build_vocab(texts: list[str]) -> dict[str, int]:
     chars = sorted({c for t in texts for c in clean(t)})
     # "|" stands in for space so the tokenizer can treat it as a normal symbol.
     vocab = {c if c != " " else "|": i for i, c in enumerate(chars)}
     vocab["[UNK]"] = len(vocab)
     vocab["[PAD]"] = len(vocab)          # doubles as the CTC blank
+    return vocab
+
+
+def tokenizer_from_vocab(vocab: dict[str, int],
+                         out_dir: Path) -> transformers.Wav2Vec2CTCTokenizer:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "vocab.json").write_text(json.dumps(vocab, ensure_ascii=False, indent=1))
     print(f"vocab: {len(vocab)} symbols -> {out_dir/'vocab.json'}")
@@ -65,6 +70,68 @@ def build_tokenizer(texts: list[str], out_dir: Path) -> transformers.Wav2Vec2CTC
         str(out_dir / "vocab.json"),
         unk_token="[UNK]", pad_token="[PAD]", word_delimiter_token="|",
     )
+
+
+def load_from_cache_only(args, key_base: dict):
+    """Reuse a cached feature set without touching the source dataset.
+
+    The cache is normally checked *after* loading and splitting the source,
+    which on a fresh pod means re-downloading 12.6GB to produce data we already
+    have. When the manifests agree with everything except the vocabulary (which
+    is derived from the source, so we cannot recompute it without the source),
+    the vocabulary stored in the manifest is authoritative and the source is
+    not needed at all.
+
+    Returns (train_ds, valid_ds, processor, valid_refs, valid_langs) or None.
+    """
+    if args.cache_dir is None or args.in_memory:
+        return None
+
+    manifests = {t: args.cache_dir / f"{t}.json" for t in ("train", "valid")}
+    if not all(p.exists() for p in manifests.values()):
+        return None
+    if not all(shard_files(args.cache_dir, t) for t in ("train", "valid")):
+        return None
+
+    stored = {t: json.loads(p.read_text()) for t, p in manifests.items()}
+    speeds = tuple(float(s) for s in args.speed_perturb.split(",")) \
+        if args.speed_perturb else (1.0,)
+
+    want = {"train": {**key_base, "speeds": list(speeds)}, "valid": dict(key_base)}
+    for tag, w in want.items():
+        got = {k: v for k, v in stored[tag].items() if k != "vocab"}
+        if got != w:
+            print(f"cached '{tag}' was built with different settings; "
+                  "loading the source dataset instead")
+            print(f"  cached: {got}\n  wanted: {w}")
+            return None
+
+    vocab = stored["train"].get("vocab")
+    if not isinstance(vocab, dict):
+        # Older caches stored only the sorted symbols, which cannot reproduce the
+        # token->id mapping the cached labels were written against.
+        print("cached manifest predates vocab storage; rebuilding from source")
+        return None
+
+    print(f"reusing cached features from {args.cache_dir} (source not needed)")
+    tokenizer = tokenizer_from_vocab(vocab, args.output_dir)
+    fe = transformers.AutoFeatureExtractor.from_pretrained(MODEL_ID)
+    processor = transformers.Wav2Vec2BertProcessor(feature_extractor=fe,
+                                                   tokenizer=tokenizer)
+
+    def load(tag):
+        return datasets.concatenate_datasets(
+            [datasets.Dataset.from_file(str(f))
+             for f in shard_files(args.cache_dir, tag)])
+
+    train_ds, valid_ds = load("train"), load("valid")
+    print(f"  train={len(train_ds):,}  valid={len(valid_ds):,}")
+
+    # References come back by decoding the cached labels -- the transcriptions
+    # live only in the source, which we deliberately did not load.
+    valid_refs = [tokenizer.decode(ids, group_tokens=False)
+                  for ids in valid_ds["labels"]]
+    return train_ds, valid_ds, processor, valid_refs, valid_ds["language"]
 
 
 class Collator:
@@ -438,6 +505,29 @@ def main() -> None:
         vis = "public" if args.hub_public else "private"
         print(f"checkpoints -> huggingface.co/{args.push_to_hub} ({vis})")
 
+    # Everything that decides which rows exist and what the features look like.
+    # Learning rate and epochs are deliberately absent: they don't affect
+    # features, so re-tuning them reuses the cache.
+    key_base = {
+        "model": MODEL_ID, "langs": list(wdata.LANGS), "sr": wdata.SR,
+        "valid_frac": args.valid_frac, "seed": args.seed, "limit": args.limit,
+        "min_s": args.min_s, "max_s": args.max_s,
+    }
+
+    cached = load_from_cache_only(args, key_base)
+    if cached is not None:
+        train_ds, valid_ds, processor, valid_refs, valid_langs = cached
+    else:
+        train_ds, valid_ds, processor, valid_refs, valid_langs = \
+            build_from_source(args, key_base)
+
+    tokenizer = processor.tokenizer
+    build_and_train(args, processor, tokenizer, train_ds, valid_ds,
+                    valid_refs, valid_langs)
+
+
+def build_from_source(args, key_base: dict):
+    """Download, filter, split, and extract features from the source dataset."""
     print("loading labeled data (train+validation only; test is off-limits)")
     # With --limit, fetch one parquet shard per language instead of all ~12.6GB.
     ds = wdata.load_labeled(num_proc=args.load_proc, shards=1 if args.limit else 0)
@@ -469,22 +559,17 @@ def main() -> None:
     split = wdata.speaker_disjoint_split(ds, args.valid_frac, args.seed)
     print(f"  {split}")
 
-    tokenizer = build_tokenizer(split.train["transcription"], args.output_dir)
+    vocab = build_vocab(split.train["transcription"])
+    tokenizer = tokenizer_from_vocab(vocab, args.output_dir)
     fe = transformers.AutoFeatureExtractor.from_pretrained(MODEL_ID)
     processor = transformers.Wav2Vec2BertProcessor(feature_extractor=fe, tokenizer=tokenizer)
 
-    # Everything that changes the extracted features or which rows they cover.
-    # The learning rate and epoch count deliberately aren't here -- they don't
-    # affect features, so re-tuning them should reuse the cache.
     speeds = tuple(float(s) for s in args.speed_perturb.split(",")) \
         if args.speed_perturb else (1.0,)
 
-    key = {
-        "model": MODEL_ID, "langs": list(wdata.LANGS), "sr": wdata.SR,
-        "valid_frac": args.valid_frac, "seed": args.seed, "limit": args.limit,
-        "min_s": args.min_s, "max_s": args.max_s,   # change which rows survive
-        "vocab": sorted(processor.tokenizer.get_vocab()),
-    }
+    # The full token->id map, not just the symbols: the cached labels were
+    # written against these exact ids, so a reload must reproduce them.
+    key = {**key_base, "vocab": vocab}
     # Augment training only. A perturbed validation set would measure the model
     # on audio the Phase 2 set will never contain, and would not be comparable
     # to the un-augmented baseline.
@@ -500,7 +585,11 @@ def main() -> None:
               f"-> {len(train_ds):,} rows")
     valid_langs = valid_ds["language"]
     valid_refs = [clean(t) for t in split.valid["transcription"]]
+    return train_ds, valid_ds, processor, valid_refs, valid_langs
 
+
+def build_and_train(args, processor, tokenizer, train_ds, valid_ds,
+                    valid_refs, valid_langs) -> None:
     model = transformers.Wav2Vec2BertForCTC.from_pretrained(
         MODEL_ID,
         attention_dropout=0.0, hidden_dropout=0.0, feat_proj_dropout=0.0,

@@ -40,7 +40,7 @@ def profile(path: Path) -> pd.DataFrame | None:
 def main() -> int:
     train = profile(RAW / "Train.csv")
     test = profile(RAW / "Test.csv")
-    sub = profile(RAW / "SampleSubmission.csv")
+    profile(RAW / "SampleSubmission.csv")
 
     if train is None:
         print("\nDownload the CSVs from Zindi into data/raw/ first.")

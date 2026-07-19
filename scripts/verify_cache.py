@@ -50,7 +50,6 @@ def main() -> int:
     for repo in entries:
         for rev in repo.revisions:
             for f in rev.files:
-                name = str(f.file_name)
                 # file_name is the path within the repo snapshot
                 rel = str(f.file_path).split("/snapshots/")[-1]
                 rel = "/".join(rel.split("/")[1:]) if "/" in rel else rel
