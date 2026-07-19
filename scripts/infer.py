@@ -20,6 +20,40 @@ import transformers
 from waxal import data as wdata
 
 
+MODEL_ID = "facebook/w2v-bert-2.0"
+
+
+def load_processor(model_dir: Path, vocab: Path | None):
+    """Load the processor, rebuilding it if the checkpoint lacks one.
+
+    Trainer's intermediate checkpoints hold only model weights -- the processor
+    is written by save_pretrained at the end of training. Since the feature
+    extractor is just the pretrained one and the tokenizer is fully determined
+    by vocab.json (which training writes to --output-dir), we can reconstruct it
+    from the checkpoint's parent rather than requiring a finished run.
+    """
+    try:
+        return transformers.Wav2Vec2BertProcessor.from_pretrained(str(model_dir))
+    except OSError:
+        pass
+
+    candidates = [vocab] if vocab else []
+    candidates += [model_dir / "vocab.json", model_dir.parent / "vocab.json"]
+    found = next((p for p in candidates if p and p.exists()), None)
+    if found is None:
+        raise SystemExit(
+            f"no processor in {model_dir} and no vocab.json in it or its parent.\n"
+            f"Pass --vocab /path/to/vocab.json (training writes it to --output-dir)."
+        )
+
+    print(f"checkpoint has no processor; rebuilding from {found}")
+    tokenizer = transformers.Wav2Vec2CTCTokenizer(
+        str(found), unk_token="[UNK]", pad_token="[PAD]", word_delimiter_token="|")
+    fe = transformers.AutoFeatureExtractor.from_pretrained(MODEL_ID)
+    return transformers.Wav2Vec2BertProcessor(feature_extractor=fe,
+                                              tokenizer=tokenizer)
+
+
 @torch.no_grad()
 def transcribe(ds, model, processor, device, batch_size: int = 8) -> dict[str, str]:
     model.eval().to(device)
@@ -47,13 +81,17 @@ def main() -> None:
     ap.add_argument("--phase2-dir", type=str, default="")
     ap.add_argument("--sample-submission", type=Path,
                     default=Path("data/raw/SampleSubmission.csv"))
+    ap.add_argument("--vocab", type=Path, default=None,
+                    help="vocab.json to rebuild the tokenizer from, if the "
+                         "checkpoint has no processor. Defaults to looking in the "
+                         "model dir and its parent")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--num-proc", type=int, default=1,
                     help="dataset loading workers; keep low (see train_ctc.py)")
     args = ap.parse_args()
 
-    processor = transformers.Wav2Vec2BertProcessor.from_pretrained(str(args.model))
+    processor = load_processor(args.model, args.vocab)
     model = transformers.Wav2Vec2BertForCTC.from_pretrained(str(args.model))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
