@@ -158,6 +158,40 @@ Kaggle GPU sessions cap at ~9 hours, so size `--epochs` to fit.
 """))
 
     cells.append(md("""
+## 2d. Speed perturbation — **A100 only, will not fit a Kaggle session**
+
+Each clip is resampled to 0.9x / 1.0x / 1.1x, tripling the training set. Pitch
+shifts with speed, which is the point: each copy behaves like a different
+speaker, and Phase 2 is scored on unheard voices.
+
+Measured costs per epoch, batch 4 / accum 8:
+
+| | rows | Kaggle T4 | A100 |
+|---|---|---|---|
+| normal | 31,316 | 5.4 h | 1.4 h |
+| perturbed | 93,948 | **16.3 h** | 4.2 h |
+
+A Kaggle GPU session caps around 9 hours, so one epoch overruns. It also changes
+the cache key, so the pulled cache no longer matches and you would first pay a
+12.6 GB download plus ~1.7 h of 3x extraction on a T4.
+
+Run it on the A100 instead:
+
+```bash
+python scripts/train_ctc.py \\
+    --init-from ngia/ctc-v2 \\
+    --output-dir /dev/shm/ctc-v3 \\
+    --cache-dir /dev/shm/cache-sp \\
+    --speed-perturb 0.9,1.0,1.1 \\
+    --push-to-hub ngia/ctc-v3 --hub-strategy end \\
+    --epochs 2 --batch-size 4 --grad-accum 8 --lr 2e-5 --seed 44
+```
+
+Note the separate `--cache-dir`: perturbed features are a different (3x larger,
+~30 GB) cache, and keeping them apart means the unperturbed one stays valid.
+"""))
+
+    cells.append(md("""
 ## 3. Smoke test
 
 A few hundred rows end-to-end first. The full run costs hours; a typo shouldn't

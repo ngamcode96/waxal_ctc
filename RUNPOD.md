@@ -208,11 +208,25 @@ invalidate the feature cache** — sweep them freely:
 ```
 
 Speed perturbation changes the audio, so it **does** invalidate the cache and
-multiplies extraction time and disk by the number of factors:
+multiplies extraction time and disk by the number of factors. Give it its own
+`--cache-dir` so the unperturbed cache stays valid:
 
 ```bash
---speed-perturb 0.9,1.0,1.1
+python scripts/train_ctc.py \
+    --init-from ngia/ctc-v2 \
+    --output-dir /dev/shm/ctc-v3 \
+    --cache-dir /dev/shm/cache-sp \
+    --speed-perturb 0.9,1.0,1.1 \
+    --push-to-hub ngia/ctc-v3 --hub-strategy end \
+    --epochs 2 --batch-size 4 --grad-accum 8 --lr 2e-5 --seed 44
 ```
+
+Costs per epoch at batch 4 / accum 8: 31,316 rows -> 93,948, so **1.4 h -> 4.2 h
+on an A100**. Not viable on a Kaggle T4, which would need 16.3 h per epoch
+against a ~9 h session cap.
+
+Pitch shifts along with speed, deliberately: each copy behaves like a different
+speaker, which is what Phase 2 tests.
 
 Augmentation applies to the training split only — a perturbed validation set
 would not be comparable to the baseline.
