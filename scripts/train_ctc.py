@@ -635,7 +635,15 @@ def build_and_train(args, processor, tokenizer, train_ds, valid_ds,
         hyps = processor.batch_decode(ids)
         s = score(valid_refs, hyps)
         per = score_by_language(valid_refs, hyps, valid_langs)
-        out = {"wer": s.wer, "cer": s.cer, "combined": s.combined}
+        # Zindi does not publish whether it averages per utterance or computes
+        # corpus-level rates. They diverge sharply here -- short clips carry
+        # huge per-utterance WER -- so log both and compare against the
+        # leaderboard to learn which one we are actually being scored on.
+        out = {
+            "wer": s.wer, "cer": s.cer, "combined": s.combined,
+            "combined_mean": s.combined_mean,
+            "wer_mean": s.wer_mean, "cer_mean": s.cer_mean,
+        }
         out.update({f"combined_{l}": v.combined for l, v in per.items()})
         return out
 
