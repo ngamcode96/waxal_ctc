@@ -120,6 +120,8 @@ def main() -> None:
     ap.add_argument("--lm", type=Path, default=None,
                     help="KenLM .arpa from build_lm.py; enables beam decoding")
     ap.add_argument("--unigrams", type=Path, default=None)
+    ap.add_argument("--dump", type=Path, default=None,
+                    help="write ref/hyp pairs as JSONL for offline error analysis")
     ap.add_argument("--alpha", type=float, default=0.5,
                     help="LM weight; higher trusts the language model more")
     ap.add_argument("--beta", type=float, default=1.5,
@@ -168,8 +170,28 @@ def main() -> None:
         print(f"  {lo:>5}-{hi:<5} n={len(idx):>5}  "
               f"corpus {b.combined:.4f}   mean {b.combined_mean:.4f}")
 
+    # How much of the WER is segmentation/casing rather than misheard sound?
+    # Collapsing spaces and case removes exactly those two error classes; what
+    # is left is genuine acoustic error.
+    import re as _re
+    def flat(t):
+        return _re.sub(r"\s+", "", t).lower()
+    s_flat = score([flat(r) for r in refs], [flat(h) for h in hyps])
+    print(f"\nignoring spacing and case: CER {s_flat.cer:.4f} "
+          f"(vs {s.cer:.4f} as-is)")
+    print("  the difference is what segmentation and casing cost you")
+
     empty = sum(1 for h in hyps if not h.strip())
     print(f"\nempty hypotheses: {empty}/{len(hyps)}")
+
+    if args.dump:
+        args.dump.parent.mkdir(parents=True, exist_ok=True)
+        import json as _json
+        args.dump.write_text("\n".join(
+            _json.dumps({"ref": r, "hyp": h, "lang": l, "len": n},
+                        ensure_ascii=False)
+            for r, h, l, n in zip(refs, hyps, ds["language"], lengths)))
+        print(f"\ndumped {len(refs):,} pairs -> {args.dump}")
     print("\nfirst 3:")
     for r, h in list(zip(refs, hyps))[:3]:
         print(f"  ref: {r[:100]}\n  hyp: {h[:100]}\n")
