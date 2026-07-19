@@ -88,6 +88,11 @@ def main() -> int:
     ap.add_argument("--order", type=int, default=5, help="n-gram order")
     ap.add_argument("--lmplz", default="lmplz",
                     help="path to KenLM's lmplz binary")
+    ap.add_argument("--memory", default="4G",
+                    help="lmplz sort buffer (-S). Its default of 80%% of physical "
+                         "RAM gets OOM-killed inside a container")
+    ap.add_argument("--temp-dir", type=Path, default=Path("/tmp/lmplz"),
+                    help="lmplz scratch space (-T)")
     args = ap.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -128,8 +133,15 @@ def main() -> int:
     # prune: keep all unigrams/bigrams, drop singleton 3+ grams. With 65% hapax
     # words, unpruned high-order counts are mostly noise and bloat the model.
     prune = ["0", "0"] + ["1"] * (args.order - 2)
+    # -S caps the sort buffer. lmplz otherwise claims 80% of *physical* RAM,
+    # which inside a container is the host's, not the cgroup limit -- it then
+    # gets OOM-killed (SIGKILL) partway through counting. This corpus is ~6MB,
+    # so a few GB is generous.
+    # -T keeps temp files off /tmp, which is on the small container disk.
+    args.temp_dir.mkdir(parents=True, exist_ok=True)
     cmd = [args.lmplz, "-o", str(args.order), "--prune", *prune,
-           "--discount_fallback"]
+           "--discount_fallback",
+           "-S", args.memory, "-T", str(args.temp_dir)]
     print(f"\n$ {' '.join(cmd)} < {corpus} > {arpa}")
     with corpus.open() as fin, arpa.open("w") as fout:
         subprocess.run(cmd, stdin=fin, stdout=fout, check=True)
