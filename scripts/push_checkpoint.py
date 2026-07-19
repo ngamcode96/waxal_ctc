@@ -44,6 +44,32 @@ def latest_complete(output_dir: Path) -> Path | None:
     return None
 
 
+def push_one(api, ck: Path, output_dir: Path, repo: str, public: bool,
+             with_optimizer: bool) -> bool:
+    wanted = INFERENCE_FILES + (RESUME_FILES if with_optimizer else [])
+    # The processor lives in the parent (train_ctc saves it before training);
+    # the weights live in the checkpoint. Prefer the checkpoint's copy.
+    uploads: dict[str, Path] = {}
+    for name in wanted:
+        for src in (ck / name, output_dir / name):
+            if src.exists():
+                uploads.setdefault(name, src)
+
+    if "model.safetensors" not in uploads:
+        print(f"no model.safetensors in {ck} -- is this a checkpoint directory?")
+        return False
+
+    total = sum(p.stat().st_size for p in uploads.values())
+    print(f"uploading {len(uploads)} files ({total/1e9:.2f}GB) -> {repo}")
+    api.create_repo(repo, private=not public, exist_ok=True)
+    for name, src in sorted(uploads.items()):
+        api.upload_file(path_or_fileobj=str(src), path_in_repo=name,
+                        repo_id=repo, commit_message=f"{ck.name}: {name}")
+        print(f"  pushed {name}")
+    print(f"done -> https://huggingface.co/{repo}")
+    return True
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--output-dir", type=Path, required=True,
@@ -52,48 +78,46 @@ def main() -> int:
                     help="a specific checkpoint; defaults to the newest complete one")
     ap.add_argument("--repo", required=True)
     ap.add_argument("--public", action="store_true")
+    ap.add_argument("--watch", action="store_true",
+                    help="keep running: push each new completed checkpoint to the "
+                         "same repo as training produces them")
+    ap.add_argument("--interval", type=int, default=300,
+                    help="seconds between checks in --watch mode")
     ap.add_argument("--with-optimizer", action="store_true",
                     help="also upload optimizer/scheduler state (~2.4GB) so the "
                          "run can be resumed elsewhere")
     args = ap.parse_args()
+
+    api = HfApi()
+
+    if args.watch:
+        # Poll for new completed checkpoints and mirror each into the same repo,
+        # overwriting. Training is untouched -- this only reads.
+        import time
+        print(f"watching {args.output_dir} every {args.interval}s "
+              f"-> {args.repo} (Ctrl+C to stop)")
+        pushed = -1
+        while True:
+            ck = latest_complete(args.output_dir)
+            if ck is not None:
+                step = int(ck.name.split("-")[1])
+                if step > pushed:
+                    print(f"\n[{ck.name}] new checkpoint")
+                    if push_one(api, ck, args.output_dir, args.repo,
+                                args.public, args.with_optimizer):
+                        pushed = step
+            time.sleep(args.interval)
 
     ck = args.checkpoint or latest_complete(args.output_dir)
     if ck is None:
         print(f"no complete checkpoint in {args.output_dir}")
         return 1
     print(f"checkpoint: {ck}")
-
-    wanted = INFERENCE_FILES + (RESUME_FILES if args.with_optimizer else [])
-    # The processor lives in the parent (train_ctc saves it before training);
-    # the weights live in the checkpoint. Prefer the checkpoint's copy.
-    uploads: dict[str, Path] = {}
-    for name in wanted:
-        for src in (ck / name, args.output_dir / name):
-            if src.exists():
-                uploads.setdefault(name, src)
-
-    if "model.safetensors" not in uploads:
-        print(f"no model.safetensors in {ck} -- is this a checkpoint directory?")
-        return 1
-
-    total = sum(p.stat().st_size for p in uploads.values())
-    print(f"uploading {len(uploads)} files ({total/1e9:.2f}GB) -> {args.repo}")
-    for name, src in sorted(uploads.items()):
-        print(f"  {name:28s} {src.stat().st_size/1e6:8.1f}MB  ({src.parent.name})")
-
-    api = HfApi()
-    api.create_repo(args.repo, private=not args.public, exist_ok=True)
-    for name, src in sorted(uploads.items()):
-        api.upload_file(path_or_fileobj=str(src), path_in_repo=name,
-                        repo_id=args.repo,
-                        commit_message=f"{ck.name}: {name}")
-        print(f"  pushed {name}")
-
-    print(f"\ndone -> https://huggingface.co/{args.repo}")
-    print(f"infer with:  --model {args.repo}")
-    if not args.with_optimizer:
+    ok = push_one(api, ck, args.output_dir, args.repo, args.public,
+                  args.with_optimizer)
+    if ok and not args.with_optimizer:
         print("(inference only; pass --with-optimizer to make it resumable)")
-    return 0
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
