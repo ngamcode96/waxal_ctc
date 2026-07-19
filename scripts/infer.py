@@ -67,8 +67,16 @@ def main() -> None:
 
     preds = transcribe(ds, model, processor, device, args.batch_size)
 
-    sub = pd.read_csv(args.sample_submission, escapechar="\\")
-    sub["Target"] = sub.ID.map(preds)
+    if args.sample_submission and args.sample_submission.exists():
+        sub = pd.read_csv(args.sample_submission, escapechar="\\")
+        sub["Target"] = sub.ID.map(preds)
+    else:
+        # SampleSubmission.csv is gitignored, so it is often absent on a rented
+        # box. The ids we just transcribed are the same set, and Zindi matches
+        # on the ID column rather than row order.
+        print(f"no sample submission at {args.sample_submission} -- "
+              "building from the transcribed ids")
+        sub = pd.DataFrame({"ID": list(preds), "Target": list(preds.values())})
 
     missing = sub.Target.isna().sum()
     if missing:
