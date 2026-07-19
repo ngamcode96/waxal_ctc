@@ -477,6 +477,11 @@ def main() -> None:
                     help=f"upload checkpoints as they are saved, surviving pod "
                          f"loss. Bare flag uses {HUB_USER}/<output-dir-name>; pass "
                          f"a value to override, e.g. {HUB_USER}/waxal-ctc-v1")
+    ap.add_argument("--hub-strategy", choices=("every_save", "end"),
+                    default="every_save",
+                    help="every_save: upload each epoch (~5GB, insurance against "
+                         "losing the pod, but can stall training on a slow uplink). "
+                         "end: upload once when training finishes")
     ap.add_argument("--hub-public", action="store_true",
                     help="publish the Hub repo publicly. Off by default: the rules "
                          "forbid sharing work outside your team during the challenge")
@@ -672,7 +677,7 @@ def build_and_train(args, processor, tokenizer, train_ds, valid_ds,
         # dies mid-run costs one epoch rather than the whole run.
         **({"push_to_hub": True,
             "hub_model_id": args.push_to_hub,
-            "hub_strategy": "every_save",
+            "hub_strategy": args.hub_strategy,
             "hub_private_repo": not args.hub_public} if args.push_to_hub else {}),
     )
 
