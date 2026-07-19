@@ -21,6 +21,7 @@ on anyway.
 """
 
 import argparse
+import json
 import shutil
 import subprocess
 import sys
@@ -30,6 +31,32 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import datasets
+
+
+def resolve_vocab(cache_dir: Path, vocab_path: Path | None) -> Path:
+    """Find a vocab.json, falling back to the one inside the cache manifest.
+
+    The manifest stores the exact token->id map the cached labels were written
+    against, so the cache is self-sufficient -- no training run required.
+    """
+    if vocab_path and vocab_path.exists():
+        return vocab_path
+
+    manifest = cache_dir / "train.json"
+    if not manifest.exists():
+        raise SystemExit(
+            f"no vocab.json at {vocab_path} and no manifest at {manifest}")
+
+    vocab = json.loads(manifest.read_text()).get("vocab")
+    if not isinstance(vocab, dict):
+        raise SystemExit(
+            f"{manifest} has no token->id map (old-format cache). "
+            f"Pass --vocab explicitly.")
+
+    out = cache_dir / "vocab.json"
+    out.write_text(json.dumps(vocab, ensure_ascii=False, indent=1))
+    print(f"vocab from cache manifest -> {out} ({len(vocab)} symbols)")
+    return out
 
 
 def corpus_from_cache(cache_dir: Path, vocab_path: Path) -> list[str]:
@@ -54,8 +81,9 @@ def corpus_from_cache(cache_dir: Path, vocab_path: Path) -> list[str]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cache-dir", type=Path, required=True)
-    ap.add_argument("--vocab", type=Path, required=True,
-                    help="vocab.json from training (--output-dir)")
+    ap.add_argument("--vocab", type=Path, default=None,
+                    help="vocab.json from training; defaults to the "
+                         "one stored in the cache manifest")
     ap.add_argument("--out", type=Path, required=True, help="output directory")
     ap.add_argument("--order", type=int, default=5, help="n-gram order")
     ap.add_argument("--lmplz", default="lmplz",
@@ -63,7 +91,8 @@ def main() -> int:
     args = ap.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
-    texts = corpus_from_cache(args.cache_dir, args.vocab)
+    vocab_path = resolve_vocab(args.cache_dir, args.vocab)
+    texts = corpus_from_cache(args.cache_dir, vocab_path)
 
     # Keep the original casing. Tempting to lowercase -- it would nearly halve
     # the type count and sharpen the estimates -- but pyctcdecode scores the
