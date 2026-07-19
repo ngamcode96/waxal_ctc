@@ -120,6 +120,8 @@ def main() -> None:
     ap.add_argument("--lm", type=Path, default=None,
                     help="KenLM .arpa from build_lm.py; enables beam decoding")
     ap.add_argument("--unigrams", type=Path, default=None)
+    ap.add_argument("--limit", type=int, default=0,
+                    help="score only N clips -- for fast alpha/beta sweeps")
     ap.add_argument("--dump", type=Path, default=None,
                     help="write ref/hyp pairs as JSONL for offline error analysis")
     ap.add_argument("--alpha", type=float, default=0.5,
@@ -135,6 +137,10 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     ds = load_valid(args.cache_dir)
+    if args.limit:
+        # A stratified-enough subset for parameter sweeps: shuffling first keeps
+        # all three languages represented, since the shards are ordered by language.
+        ds = ds.shuffle(seed=0).select(range(min(args.limit, len(ds))))
     print(f"validation: {len(ds):,} clips")
 
     decoder = None
