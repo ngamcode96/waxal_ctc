@@ -486,7 +486,14 @@ def main() -> None:
                     help="publish the Hub repo publicly. Off by default: the rules "
                          "forbid sharing work outside your team during the challenge")
     ap.add_argument("--resume", action="store_true",
-                    help="resume from the last checkpoint in --output-dir")
+                    help="resume from the last checkpoint in --output-dir, "
+                         "restoring optimizer and LR schedule")
+    ap.add_argument("--init-from", type=str, default="",
+                    help="continue from a finished run: a local checkpoint or Hub "
+                         "repo id (e.g. ngia/ctc-v1). Loads the weights but starts "
+                         "a fresh optimizer and LR schedule, which --resume does "
+                         "not -- a completed schedule has decayed to zero. Lower "
+                         "--lr (2e-5) suits an already-trained model")
     # SpecAugment. Applied inside the model at training time only, so it costs
     # nothing extra and does NOT invalidate the feature cache -- tune these freely.
     ap.add_argument("--mask-time-prob", type=float, default=0.05,
@@ -621,8 +628,15 @@ def build_from_source(args, key_base: dict):
 
 def build_and_train(args, processor, tokenizer, train_ds, valid_ds,
                     valid_refs, valid_langs) -> None:
+    # --init-from continues an earlier run: load its weights but start a fresh
+    # optimizer and LR schedule. Distinct from --resume, which restores the old
+    # schedule too -- and a finished run's schedule has already decayed to zero,
+    # so resuming it would train at effectively no learning rate.
+    init_from = args.init_from or MODEL_ID
+    if args.init_from:
+        print(f"warm start from {args.init_from} (fresh optimizer and schedule)")
     model = transformers.Wav2Vec2BertForCTC.from_pretrained(
-        MODEL_ID,
+        init_from,
         attention_dropout=0.0, hidden_dropout=0.0, feat_proj_dropout=0.0,
         # SpecAugment-style masking is the main regularizer here; the labeled
         # set is small relative to the 580M encoder.

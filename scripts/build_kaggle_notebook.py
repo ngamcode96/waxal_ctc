@@ -132,6 +132,32 @@ sub.head(10)
 """))
 
     cells.append(md("""
+## 2c. Continue training an earlier run
+
+Warm-starts from a finished model on the Hub: loads its weights, then trains
+with a **fresh optimizer and LR schedule**. That is what you want after a run
+completes — `--resume` would restore the old schedule, which has already decayed
+to zero.
+
+Pull the cached features first so this skips the 12.6 GB download and the ~10 min
+feature extraction entirely. Use a **lower learning rate** than the original run:
+the model is already trained, and 5e-5 would undo some of that.
+
+Kaggle GPU sessions cap at ~9 hours, so size `--epochs` to fit.
+"""))
+    cells.append(code("""
+!python scripts/sync_features.py pull --cache-dir /kaggle/temp/cache
+
+!python scripts/train_ctc.py \\
+    --init-from ngia/ctc-v1 \\
+    --output-dir /kaggle/working/ctc-v1b \\
+    --cache-dir /kaggle/temp/cache \\
+    --push-to-hub ngia/ctc-v1b \\
+    --hub-strategy end \\
+    --epochs 3 --batch-size 4 --grad-accum 8 --lr 2e-5 --seed 43
+"""))
+
+    cells.append(md("""
 ## 3. Smoke test
 
 A few hundred rows end-to-end first. The full run costs hours; a typo shouldn't
