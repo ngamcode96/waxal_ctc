@@ -209,7 +209,8 @@ def shard_files(cache_dir: Path, tag: str) -> list[Path]:
 
 
 def prepare(ds, processor, num_proc: int, speeds: tuple[float, ...] = (1.0,),
-            writer_batch_size: int = 100, cache_file: Path | None = None):
+            writer_batch_size: int = 100, cache_file: Path | None = None,
+            in_memory: bool = False):
     """Extract features. Uses the cheaper non-batched path unless augmenting.
 
     writer_batch_size matters more than it looks: each feature array is ~480KB,
@@ -242,7 +243,9 @@ def prepare(ds, processor, num_proc: int, speeds: tuple[float, ...] = (1.0,),
 
         return ds.map(fn_single, remove_columns=ds.column_names, num_proc=num_proc,
                       writer_batch_size=writer_batch_size,
-                      cache_file_name=str(cache_file) if cache_file else None,
+                      keep_in_memory=in_memory,
+                      cache_file_name=None if in_memory else (
+                          str(cache_file) if cache_file else None),
                       desc="extracting features")
 
     def fn(batch):
@@ -265,7 +268,9 @@ def prepare(ds, processor, num_proc: int, speeds: tuple[float, ...] = (1.0,),
     return ds.map(fn, remove_columns=ds.column_names, num_proc=num_proc,
                   batched=True, batch_size=1,
                   writer_batch_size=writer_batch_size,
-                  cache_file_name=str(cache_file) if cache_file else None,
+                  keep_in_memory=in_memory,
+                  cache_file_name=None if in_memory else (
+                      str(cache_file) if cache_file else None),
                   desc=f"extracting features (speeds={list(speeds)})")
 
 
@@ -298,7 +303,8 @@ def check_disk_space(rows: int, cache_dir: Path) -> None:
 
 
 def prepare_cached(ds, processor, num_proc: int, cache_dir: Path | None, tag: str,
-                   key: dict, speeds: tuple[float, ...] = (1.0,)):
+                   key: dict, speeds: tuple[float, ...] = (1.0,),
+                   in_memory: bool = False):
     """Feature extraction with an explicit on-disk cache.
 
     datasets.map caches by fingerprint, but the fingerprint hashes the mapped
@@ -308,6 +314,14 @@ def prepare_cached(ds, processor, num_proc: int, cache_dir: Path | None, tag: st
     leave to chance, so we save explicitly and validate against the parameters
     that actually affect the output.
     """
+    if in_memory:
+        # No filesystem at all. ~8.3GB of features against 117GB of RAM, and it
+        # sidesteps storage that fails on close (RunPod's MooseFS: Errno 5 at
+        # writer.finalize(), whichever component happens to write last). Costs a
+        # re-extraction each run -- ~10 min -- which beats a run that dies.
+        print("extracting to memory (no cache; re-extracts each run)")
+        return prepare(ds, processor, num_proc, speeds, in_memory=True)
+
     if cache_dir is None:
         return prepare(ds, processor, num_proc, speeds)
 
@@ -355,6 +369,11 @@ def main() -> None:
     ap.add_argument("--gradient-checkpointing", default=None,
                     action=argparse.BooleanOptionalAction,
                     help="default: off when the GPU has >40GB, on otherwise")
+    ap.add_argument("--in-memory", action="store_true",
+                    help="extract features into RAM, never touching a filesystem. "
+                         "~8.3GB for this dataset. Use when storage is unreliable "
+                         "(RunPod network volumes fail on close with Errno 5). "
+                         "Costs a ~10min re-extraction every run")
     ap.add_argument("--free-download-cache", action="store_true",
                     help="delete the downloaded parquet (~13GB) once it has been "
                          "converted to Arrow, before extraction writes its output. "
@@ -466,9 +485,11 @@ def main() -> None:
     # to the un-augmented baseline.
     train_ds = prepare_cached(split.train, processor, args.num_proc,
                               args.cache_dir, "train",
-                              {**key, "speeds": list(speeds)}, speeds)
+                              {**key, "speeds": list(speeds)}, speeds,
+                              in_memory=args.in_memory)
     valid_ds = prepare_cached(split.valid, processor, args.num_proc,
-                              args.cache_dir, "valid", key)
+                              args.cache_dir, "valid", key,
+                              in_memory=args.in_memory)
     if speeds != (1.0,):
         print(f"speed perturbation {list(speeds)}: train {len(split.train):,} "
               f"-> {len(train_ds):,} rows")
