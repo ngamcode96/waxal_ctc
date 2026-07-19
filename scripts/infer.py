@@ -67,6 +67,33 @@ def load_processor(model_dir: Path, vocab: Path | None):
                                               tokenizer=tokenizer)
 
 
+def _ctc_labels(processor) -> list[str]:
+    """The alphabet as pyctcdecode wants it: one entry per token id.
+
+    pyctcdecode requires single-character labels -- it treats any multi-character
+    entry as BPE-style tokenization and decodes accordingly. Our vocabulary has
+    three multi-character tokens ([UNK], plus <s>/</s> which the tokenizer appends
+    automatically), so they are mapped to single placeholder characters that
+    cannot occur in the transcripts. They are never predicted anyway: the model
+    has no training signal for them.
+    """
+    vocab = processor.tokenizer.get_vocab()
+    labels = [tok for tok, _ in sorted(vocab.items(), key=lambda kv: kv[1])]
+
+    placeholders = iter("\u2047\u2048\u2049\u204a\u204b")
+    out = []
+    for tok in labels:
+        if tok == "[PAD]":
+            out.append("")          # CTC blank
+        elif tok == "|":
+            out.append(" ")         # word delimiter
+        elif len(tok) > 1:
+            out.append(next(placeholders))
+        else:
+            out.append(tok)
+    return out
+
+
 def build_lm_decoder(processor, lm: Path, unigrams: Path | None,
                      alpha: float, beta: float):
     """Beam decoder over the model's own alphabet, scored by an n-gram LM.
@@ -76,9 +103,7 @@ def build_lm_decoder(processor, lm: Path, unigrams: Path | None,
     """
     from pyctcdecode import build_ctcdecoder
 
-    vocab = processor.tokenizer.get_vocab()
-    labels = [tok for tok, _ in sorted(vocab.items(), key=lambda kv: kv[1])]
-    labels = ["" if t == "[PAD]" else " " if t == "|" else t for t in labels]
+    labels = _ctc_labels(processor)
 
     words = None
     if unigrams and unigrams.exists():
