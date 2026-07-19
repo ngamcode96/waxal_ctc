@@ -67,8 +67,30 @@ def load_processor(model_dir: Path, vocab: Path | None):
                                               tokenizer=tokenizer)
 
 
+def build_lm_decoder(processor, lm: Path, unigrams: Path | None,
+                     alpha: float, beta: float):
+    """Beam decoder over the model's own alphabet, scored by an n-gram LM.
+
+    pyctcdecode expects the alphabet ordered by token id, with the CTC blank as
+    "" and the word delimiter as a literal space.
+    """
+    from pyctcdecode import build_ctcdecoder
+
+    vocab = processor.tokenizer.get_vocab()
+    labels = [tok for tok, _ in sorted(vocab.items(), key=lambda kv: kv[1])]
+    labels = ["" if t == "[PAD]" else " " if t == "|" else t for t in labels]
+
+    words = None
+    if unigrams and unigrams.exists():
+        words = [w for w in unigrams.read_text().split("\n") if w]
+
+    return build_ctcdecoder(labels, kenlm_model_path=str(lm), unigrams=words,
+                            alpha=alpha, beta=beta)
+
+
 @torch.no_grad()
-def transcribe(ds, model, processor, device, batch_size: int = 8) -> dict[str, str]:
+def transcribe(ds, model, processor, device, batch_size: int = 8,
+               decoder=None) -> dict[str, str]:
     model.eval().to(device)
     out: dict[str, str] = {}
     for start in range(0, len(ds), batch_size):
@@ -80,7 +102,13 @@ def transcribe(ds, model, processor, device, batch_size: int = 8) -> dict[str, s
         with torch.autocast(device_type=device.type,
                             dtype=torch.bfloat16, enabled=device.type == "cuda"):
             logits = model(**feats).logits
-        hyps = processor.batch_decode(logits.argmax(-1).cpu().numpy())
+        if decoder is None:
+            hyps = processor.batch_decode(logits.argmax(-1).cpu().numpy())
+        else:
+            # Beam search needs the full distribution, and pyctcdecode is
+            # float32-only. This runs on CPU, so it is the slow part.
+            lp = logits.float().cpu().numpy()
+            hyps = [decoder.decode(lp[i]) for i in range(lp.shape[0])]
         out.update(zip(rows["id"], hyps))
         if start % (batch_size * 25) == 0:
             print(f"  {min(start + batch_size, len(ds)):,}/{len(ds):,}", flush=True)
@@ -102,6 +130,13 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--num-proc", type=int, default=1,
                     help="dataset loading workers; keep low (see train_ctc.py)")
+    ap.add_argument("--lm", type=Path, default=None,
+                    help="KenLM .arpa from build_lm.py; switches greedy decoding "
+                         "for beam search. Needs pyctcdecode and kenlm installed")
+    ap.add_argument("--unigrams", type=Path, default=None)
+    ap.add_argument("--alpha", type=float, default=0.5, help="LM weight")
+    ap.add_argument("--beta", type=float, default=1.5,
+                    help="word insertion bonus")
     args = ap.parse_args()
 
     processor = load_processor(args.model, args.vocab)
@@ -116,7 +151,14 @@ def main() -> None:
         ds = wdata.load_phase2_audio(args.phase2_dir, num_proc=args.num_proc)
     print(f"transcribing {len(ds):,} clips on {device}")
 
-    preds = transcribe(ds, model, processor, device, args.batch_size)
+    decoder = None
+    if args.lm:
+        decoder = build_lm_decoder(processor, args.lm, args.unigrams,
+                                   args.alpha, args.beta)
+        print(f"beam decoding with {args.lm} "
+              f"(alpha={args.alpha}, beta={args.beta})")
+
+    preds = transcribe(ds, model, processor, device, args.batch_size, decoder)
 
     if args.sample_submission and args.sample_submission.exists():
         sub = pd.read_csv(args.sample_submission, escapechar="\\")
