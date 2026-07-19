@@ -36,8 +36,29 @@ def load_valid(cache_dir: Path):
         [datasets.Dataset.from_file(str(f)) for f in shards])
 
 
+def build_lm_decoder(processor, lm: Path, unigrams: Path | None,
+                     alpha: float, beta: float):
+    """A pyctcdecode beam decoder over the same alphabet the model emits.
+
+    pyctcdecode wants the alphabet as a list ordered by token id, with the CTC
+    blank as "" and the word delimiter as a literal space.
+    """
+    from pyctcdecode import build_ctcdecoder
+
+    vocab = processor.tokenizer.get_vocab()
+    labels = [tok for tok, _ in sorted(vocab.items(), key=lambda kv: kv[1])]
+    labels = ["" if t == "[PAD]" else " " if t == "|" else t for t in labels]
+
+    words = None
+    if unigrams and unigrams.exists():
+        words = [w for w in unigrams.read_text().split("\n") if w]
+
+    return build_ctcdecoder(labels, kenlm_model_path=str(lm), unigrams=words,
+                            alpha=alpha, beta=beta)
+
+
 @torch.no_grad()
-def run(ds, model, processor, device, batch_size):
+def run(ds, model, processor, device, batch_size, decoder=None):
     model.eval().to(device)
     hyps = []
     for start in range(0, len(ds), batch_size):
@@ -53,7 +74,13 @@ def run(ds, model, processor, device, batch_size):
         with torch.autocast("cuda", dtype=torch.bfloat16,
                             enabled=device.type == "cuda"):
             logits = model(**feats).logits
-        hyps.extend(processor.batch_decode(logits.argmax(-1).cpu().numpy()))
+        if decoder is None:
+            hyps.extend(processor.batch_decode(logits.argmax(-1).cpu().numpy()))
+        else:
+            # Beam search needs the full distribution, not the argmax path, and
+            # pyctcdecode is float32-only.
+            lp = logits.float().cpu().numpy()
+            hyps.extend(decoder.decode(lp[i]) for i in range(lp.shape[0]))
         if start % (batch_size * 20) == 0:
             print(f"  {min(start + batch_size, len(ds)):,}/{len(ds):,}", flush=True)
     return hyps
@@ -65,6 +92,13 @@ def main() -> None:
     ap.add_argument("--cache-dir", type=Path, required=True)
     ap.add_argument("--vocab", type=Path, default=None)
     ap.add_argument("--batch-size", type=int, default=8)
+    ap.add_argument("--lm", type=Path, default=None,
+                    help="KenLM .arpa from build_lm.py; enables beam decoding")
+    ap.add_argument("--unigrams", type=Path, default=None)
+    ap.add_argument("--alpha", type=float, default=0.5,
+                    help="LM weight; higher trusts the language model more")
+    ap.add_argument("--beta", type=float, default=1.5,
+                    help="word insertion bonus; higher produces longer output")
     args = ap.parse_args()
 
     import transformers
@@ -76,9 +110,18 @@ def main() -> None:
     ds = load_valid(args.cache_dir)
     print(f"validation: {len(ds):,} clips")
 
+    decoder = None
+    if args.lm:
+        decoder = build_lm_decoder(processor, args.lm, args.unigrams,
+                                   args.alpha, args.beta)
+        print(f"beam decoding with {args.lm} (alpha={args.alpha}, "
+              f"beta={args.beta})")
+    else:
+        print("greedy decoding (pass --lm to compare against beam search)")
+
     refs = [processor.tokenizer.decode(ids, group_tokens=False)
             for ids in ds["labels"]]
-    hyps = run(ds, model, processor, device, args.batch_size)
+    hyps = run(ds, model, processor, device, args.batch_size, decoder)
 
     s = score(refs, hyps)
     print(f"\n{s}\n")
