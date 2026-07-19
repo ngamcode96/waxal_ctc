@@ -157,9 +157,18 @@ First run spends ~5 min downloading and ~25 min extracting features (on local
 NVMe) before the first training step. Both are cached; later runs start training
 immediately.
 
+**Use `--cache-dir /dev/shm/cache`, not a path on `/workspace`.** If the pod has
+a network volume, writes there fail at `writer.finalize()` with
+`OSError: [Errno 5] Input/output error` — reliably, after extraction has already
+completed, regardless of which component writes last. `/dev/shm` is tmpfs (RAM):
+~8.3 GB of features against 117 GB, and nothing to fail on close. `--in-memory`
+skips the cache entirely if even that is a problem, at the cost of re-extracting
+(~10 min) every run.
+
 **Push the feature cache to HF as soon as both `cached features ->` lines
-appear** — a 2 minute upload that makes extraction a one-time cost across every
-future pod, and the only protection if the pod dies:
+appear** — `/dev/shm` is volatile, so this is the only thing standing between you
+and a re-extraction. A 2 minute upload that makes extraction a one-time cost
+across every future pod:
 
 ```bash
 python scripts/sync_features.py push --cache-dir /workspace/cache
