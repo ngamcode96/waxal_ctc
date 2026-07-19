@@ -254,6 +254,34 @@ def prepare(ds, processor, num_proc: int, speeds: tuple[float, ...] = (1.0,),
                   desc=f"extracting features (speeds={list(speeds)})")
 
 
+# ~750 frames x 160 mels x 2 bytes (float16) for a typical 15s clip.
+BYTES_PER_ROW = 750 * 160 * 2
+
+
+def check_disk_space(rows: int, cache_dir: Path) -> None:
+    """Fail now rather than at writer.finalize() ten minutes in.
+
+    datasets writes the map output under HF_DATASETS_CACHE and save_to_disk then
+    copies it into cache_dir, so the peak is roughly twice the final size.
+    """
+    import shutil
+
+    need = rows * BYTES_PER_ROW * 2
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(cache_dir).free
+    print(f"disk: {free/1e9:.1f}GB free, ~{need/1e9:.1f}GB needed "
+          f"for {rows:,} rows (map output + cache copy)")
+    if free < need:
+        raise SystemExit(
+            f"\nNot enough space: {free/1e9:.1f}GB free, ~{need/1e9:.1f}GB needed.\n"
+            f"  - free the downloaded parquet with --free-download-cache (~13GB)\n"
+            f"  - or point --cache-dir at a larger disk\n"
+            f"  - or provision a bigger volume\n"
+            f"Extraction would otherwise fail at the final flush with "
+            f"'OSError: [Errno 5] Input/output error'."
+        )
+
+
 def prepare_cached(ds, processor, num_proc: int, cache_dir: Path | None, tag: str,
                    key: dict, speeds: tuple[float, ...] = (1.0,)):
     """Feature extraction with an explicit on-disk cache.
@@ -267,6 +295,8 @@ def prepare_cached(ds, processor, num_proc: int, cache_dir: Path | None, tag: st
     """
     if cache_dir is None:
         return prepare(ds, processor, num_proc, speeds)
+
+    check_disk_space(len(ds) * len(speeds), cache_dir)
 
     path = cache_dir / tag
     manifest = cache_dir / f"{tag}.json"
@@ -299,6 +329,10 @@ def main() -> None:
     ap.add_argument("--gradient-checkpointing", default=None,
                     action=argparse.BooleanOptionalAction,
                     help="default: off when the GPU has >40GB, on otherwise")
+    ap.add_argument("--free-download-cache", action="store_true",
+                    help="delete the downloaded parquet (~13GB) once it has been "
+                         "converted to Arrow, before extraction writes its output. "
+                         "Re-downloads if you need it again")
     ap.add_argument("--load-proc", type=int, default=1,
                     help="workers for dataset download/Arrow generation. Keep low: "
                          "it is I/O-bound, and high values make datasets' forked "
@@ -366,6 +400,20 @@ def main() -> None:
 
     ds = wdata.filter_usable(ds, min_s=args.min_s, max_s=args.max_s)
     print(f"  {len(ds):,} usable (clips {args.min_s}-{args.max_s}s)")
+
+    if args.free_download_cache:
+        # load_dataset has already materialized everything into Arrow, so the
+        # downloaded parquet is dead weight -- and it is ~13GB competing for the
+        # same disk that extraction is about to write to.
+        import shutil
+        hub = Path(os.environ.get("HF_HOME", Path.home() / ".cache/huggingface")) / "hub"
+        repo = hub / f"datasets--{wdata.HF_REPO.replace('/', '--')}"
+        if repo.exists():
+            freed = sum(f.stat().st_size for f in repo.rglob("*") if f.is_file())
+            shutil.rmtree(repo, ignore_errors=True)
+            print(f"freed {freed/1e9:.1f}GB of downloaded parquet ({repo})")
+        else:
+            print(f"nothing to free at {repo}")
 
     print("building speaker-disjoint validation split")
     split = wdata.speaker_disjoint_split(ds, args.valid_frac, args.seed)
