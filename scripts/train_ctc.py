@@ -461,6 +461,11 @@ def main() -> None:
                     help="drop clips longer than this. Attention is quadratic in "
                          "length, so a few long clips cost disproportionately")
     ap.add_argument("--min-s", type=float, default=0.5)
+    ap.add_argument("--max-frames", type=int, default=0,
+                    help="drop cached training clips longer than this many frames "
+                         "(~50/sec, so 1000 ~= 20s). Applied after loading, so it "
+                         "needs no re-extraction and does not change the cache key. "
+                         "The main lever against OOM: attention is quadratic here")
     ap.add_argument("--cache-dir", type=Path, default=None,
                     help="persist extracted features here so a failed run doesn't "
                          "repeat the ~40min extraction; put it on a persistent volume")
@@ -520,6 +525,20 @@ def main() -> None:
     else:
         train_ds, valid_ds, processor, valid_refs, valid_langs = \
             build_from_source(args, key_base)
+
+    if args.max_frames:
+        # Attention memory grows with the square of sequence length, so a small
+        # tail of long clips sets the peak for the whole run. Filtering here
+        # rather than at extraction means no re-extraction and no cache-key
+        # change -- the cache keeps every row, this is just a view of it.
+        before = len(train_ds)
+        train_ds = train_ds.filter(lambda n: n <= args.max_frames,
+                                   input_columns="length")
+        dropped = before - len(train_ds)
+        print(f"max-frames {args.max_frames}: train {before:,} -> {len(train_ds):,} "
+              f"({dropped:,} dropped, {100*dropped/before:.1f}%)")
+        # Validation is left intact: eval runs under no_grad, so it holds no
+        # activations and is not what drives the peak.
 
     tokenizer = processor.tokenizer
     build_and_train(args, processor, tokenizer, train_ds, valid_ds,
