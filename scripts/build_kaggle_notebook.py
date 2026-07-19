@@ -88,6 +88,8 @@ except Exception as e:
 """))
 
     cells.append(md("## 2. Source\n\nGenerated from the repo — edit there, not here."))
+    # %%writefile does not create missing parent directories.
+    cells.append(code("!mkdir -p src/waxal scripts"))
     for rel in EMBED:
         cells.append(embed_cell(rel))
     cells.append(code("""
@@ -97,6 +99,36 @@ from waxal.normalize import clean
 from waxal.metric import score
 assert clean("  Ndaba «x» 12 ⭐️  ") == 'Ndaba "x"'
 print("modules OK")
+"""))
+
+    cells.append(md("""
+## 2b. Inference only — score a trained model from the Hub
+
+Run **just this section** (cells 1–2 then here) to produce a submission from an
+already-trained model. No training, no feature extraction: it pulls the weights
+from the Hub and transcribes the Phase 1 test audio (~1.3 GB download).
+
+Needs `HF_TOKEN` in Add-ons → Secrets if the model repo is private.
+"""))
+    cells.append(code("""
+# Change --model to point at a different repo or checkpoint.
+!python scripts/infer.py \\
+    --model ngia/ctc-v1 \\
+    --phase 1 \\
+    --sample-submission /kaggle/input/waxal-csvs/SampleSubmission.csv \\
+    --out /kaggle/working/submission.csv \\
+    --batch-size 16
+"""))
+    cells.append(code("""
+import pandas as pd
+sub = pd.read_csv("/kaggle/working/submission.csv", escapechar="\\\\")
+print(sub.shape, list(sub.columns))
+empty = (sub.Target.fillna("").str.strip() == "").sum()
+print(f"empty targets: {empty}/{len(sub)}")
+# Degenerate CTC output ("Muta a a a a") shows up as repeated single letters.
+degen = sub.Target.fillna("").str.contains(r"(?:\\b(\\w)\\b[ .]*){4,}", regex=True)
+print(f"degenerate repeats: {degen.sum()} ({100*degen.mean():.1f}%)")
+sub.head(10)
 """))
 
     cells.append(md("""

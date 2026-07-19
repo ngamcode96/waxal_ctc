@@ -40,9 +40,22 @@ def load_processor(model_dir: Path, vocab: Path | None):
     candidates = [vocab] if vocab else []
     candidates += [model_dir / "vocab.json", model_dir.parent / "vocab.json"]
     found = next((p for p in candidates if p and p.exists()), None)
+
+    if found is None and not model_dir.exists() and "/" in str(model_dir):
+        # Looks like a Hub repo id rather than a local path. A repo whose
+        # processor push never completed can still carry vocab.json, which is
+        # all the tokenizer needs.
+        try:
+            from huggingface_hub import hf_hub_download
+            found = Path(hf_hub_download(str(model_dir), "vocab.json"))
+            print(f"fetched vocab.json from the Hub repo {model_dir}")
+        except Exception as e:
+            print(f"could not fetch vocab.json from {model_dir}: "
+                  f"{type(e).__name__}: {e}")
+
     if found is None:
         raise SystemExit(
-            f"no processor in {model_dir} and no vocab.json in it or its parent.\n"
+            f"no processor for {model_dir}, and no vocab.json locally or on the Hub.\n"
             f"Pass --vocab /path/to/vocab.json (training writes it to --output-dir)."
         )
 
