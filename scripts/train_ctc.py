@@ -545,6 +545,13 @@ def main() -> None:
         # Validation is left intact: eval runs under no_grad, so it holds no
         # activations and is not what drives the peak.
 
+    # Save the processor up front, not at the end. Trainer's checkpoints contain
+    # only weights, so a run that is interrupted -- or whose final save does not
+    # complete -- leaves checkpoints that cannot be loaded for inference. Written
+    # here, every checkpoint's parent directory has what it needs.
+    processor.save_pretrained(str(args.output_dir))
+    print(f"processor -> {args.output_dir}")
+
     tokenizer = processor.tokenizer
     build_and_train(args, processor, tokenizer, train_ds, valid_ds,
                     valid_refs, valid_langs)
