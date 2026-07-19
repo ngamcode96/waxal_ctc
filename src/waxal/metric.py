@@ -1,5 +1,9 @@
 """Competition metric: 0.5 * WER + 0.5 * CER.
 
+NOTE ON DIRECTION: everything here is an *error* rate, so lower is better. The
+Zindi leaderboard displays `1 - error`, where higher is better -- a leaderboard
+score of 0.781 means an error of 0.219. Don't compare the two directly.
+
 Zindi does not publish whether the metric is corpus-level (total edits / total
 reference length) or the mean of per-utterance rates. They differ, sometimes by
 a lot, so we compute both and treat the gap as a warning sign. Calibrate against
