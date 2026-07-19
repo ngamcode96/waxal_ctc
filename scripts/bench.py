@@ -63,7 +63,14 @@ def bench_gpu(batch_size: int, frames: int, vocab: int, steps: int,
 
 def bench_data(cache_dir: Path, batch_size: int, workers: int, steps: int) -> tuple:
     """Seconds per batch pulled through the real dataloader, model excluded."""
-    ds = datasets.load_from_disk(str(cache_dir / "train"))
+    # The cache is datasets.map output written straight into cache_dir as
+    # `train_00000_of_000NN.arrow` shards -- not a save_to_disk directory.
+    shards = sorted(cache_dir.glob("train_*_of_*.arrow")) or \
+        [p for p in [cache_dir / "train.arrow"] if p.exists()]
+    if not shards:
+        raise FileNotFoundError(f"no feature shards in {cache_dir}")
+    ds = datasets.concatenate_datasets(
+        [datasets.Dataset.from_file(str(f)) for f in shards])
     lengths = ds["length"]
 
     def collate(feats):
@@ -107,9 +114,11 @@ def main() -> None:
         return
     print(f"GPU: {hw.describe()}\n")
 
-    have_cache = args.cache_dir and (args.cache_dir / "train").exists()
+    have_cache = bool(args.cache_dir) and bool(
+        list(args.cache_dir.glob("train_*_of_*.arrow"))
+        or (args.cache_dir / "train.arrow").exists())
     if args.cache_dir and not have_cache:
-        print(f"no feature cache at {args.cache_dir/'train'} -- "
+        print(f"no feature shards in {args.cache_dir} -- "
               "running the GPU benchmark only\n")
     if have_cache:
         per_batch, lengths = bench_data(args.cache_dir, args.batch_size,

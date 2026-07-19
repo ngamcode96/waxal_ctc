@@ -195,8 +195,21 @@ def _resample(arr: np.ndarray, factor: float) -> np.ndarray:
     return np.interp(idx, np.arange(len(arr)), arr).astype(np.float32)
 
 
+def shard_files(cache_dir: Path, tag: str) -> list[Path]:
+    """The Arrow files datasets.map wrote for this tag, in order.
+
+    With num_proc>1 it emits `<tag>_00000_of_000NN.arrow` per worker; with a
+    single process it writes `<tag>.arrow` directly.
+    """
+    sharded = sorted(cache_dir.glob(f"{tag}_*_of_*.arrow"))
+    if sharded:
+        return sharded
+    single = cache_dir / f"{tag}.arrow"
+    return [single] if single.exists() else []
+
+
 def prepare(ds, processor, num_proc: int, speeds: tuple[float, ...] = (1.0,),
-            writer_batch_size: int = 100):
+            writer_batch_size: int = 100, cache_file: Path | None = None):
     """Extract features. Uses the cheaper non-batched path unless augmenting.
 
     writer_batch_size matters more than it looks: each feature array is ~480KB,
@@ -229,6 +242,7 @@ def prepare(ds, processor, num_proc: int, speeds: tuple[float, ...] = (1.0,),
 
         return ds.map(fn_single, remove_columns=ds.column_names, num_proc=num_proc,
                       writer_batch_size=writer_batch_size,
+                      cache_file_name=str(cache_file) if cache_file else None,
                       desc="extracting features")
 
     def fn(batch):
@@ -251,6 +265,7 @@ def prepare(ds, processor, num_proc: int, speeds: tuple[float, ...] = (1.0,),
     return ds.map(fn, remove_columns=ds.column_names, num_proc=num_proc,
                   batched=True, batch_size=1,
                   writer_batch_size=writer_batch_size,
+                  cache_file_name=str(cache_file) if cache_file else None,
                   desc=f"extracting features (speeds={list(speeds)})")
 
 
@@ -297,26 +312,34 @@ def prepare_cached(ds, processor, num_proc: int, cache_dir: Path | None, tag: st
         return prepare(ds, processor, num_proc, speeds)
 
     check_disk_space(len(ds) * len(speeds), cache_dir)
-
-    path = cache_dir / tag
+    cache_dir.mkdir(parents=True, exist_ok=True)
     manifest = cache_dir / f"{tag}.json"
-    if path.exists() and manifest.exists():
+
+    existing = shard_files(cache_dir, tag)
+    if existing and manifest.exists():
         stored = json.loads(manifest.read_text())
         if stored == key:
-            print(f"reusing cached features: {path}")
-            return datasets.load_from_disk(str(path))
+            print(f"reusing cached features: {len(existing)} shard(s) in {cache_dir}")
+            return datasets.concatenate_datasets(
+                [datasets.Dataset.from_file(str(f)) for f in existing])
         # Stale cache is worse than none -- it trains on the wrong thing silently.
-        print(f"cache at {path} was built with different settings, rebuilding")
+        print(f"cache for '{tag}' was built with different settings, rebuilding")
         print(f"  cached: {stored}\n  wanted: {key}")
+        for f in existing:
+            f.unlink()
 
-    out = prepare(ds, processor, num_proc, speeds)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Default sharding writes ~21 files for this dataset. Networked filesystems
-    # (RunPod's MooseFS) fail with Errno 5 partway through that; fewer, larger
-    # writes are more likely to survive. Local disks do not care either way.
-    out.save_to_disk(str(path), max_shard_size="2GB")
+    # Write the map output straight into cache_dir instead of letting datasets
+    # put it under HF_DATASETS_CACHE and then copying it with save_to_disk. That
+    # copy doubled peak disk *and* was the step that failed with Errno 5 on
+    # RunPod's network volume -- the map itself always succeeded. Reading the
+    # shards back with from_file gives the identical dataset.
+    out = prepare(ds, processor, num_proc, speeds,
+                  cache_file=cache_dir / f"{tag}.arrow")
     manifest.write_text(json.dumps(key, indent=1, sort_keys=True))
-    print(f"cached features -> {path}")
+    written = shard_files(cache_dir, tag)
+    total = sum(f.stat().st_size for f in written)
+    print(f"cached features -> {cache_dir} "
+          f"({len(written)} shard(s), {total/1e9:.1f}GB)")
     return out
 
 

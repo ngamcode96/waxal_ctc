@@ -4,9 +4,9 @@ Extraction costs ~50 minutes of CPU. Uploading the result (~16 GB) takes a few
 minutes, and any later pod pulls it instead of re-extracting. That turns a
 per-pod cost into a one-off.
 
-Uploads the save_to_disk directory verbatim rather than via push_to_hub, so the
-round trip is byte-identical Arrow -- no parquet conversion, and the manifest
-that validates the cache key travels with it.
+Uploads the cache directory verbatim (Arrow shards + manifests) rather than via
+push_to_hub, so the round trip is byte-identical -- no parquet conversion, and the
+manifest that validates the cache key travels with it.
 
     python scripts/sync_features.py push --cache-dir /workspace/cache
     python scripts/sync_features.py pull --cache-dir /workspace/cache
@@ -36,12 +36,25 @@ def dir_size(p: Path) -> int:
     return sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
 
 
+def shards(cache: Path, tag: str) -> list[Path]:
+    """Arrow shards datasets.map wrote for `tag` (see train_ctc.shard_files)."""
+    found = sorted(cache.glob(f"{tag}_*_of_*.arrow"))
+    if found:
+        return found
+    single = cache / f"{tag}.arrow"
+    return [single] if single.exists() else []
+
+
 def push(args) -> int:
     cache = args.cache_dir
-    if not (cache / "train").exists():
-        print(f"nothing to push: {cache/'train'} does not exist")
+    if not shards(cache, "train"):
+        print(f"nothing to push: no train_*.arrow shards in {cache}")
         print("run training once with --cache-dir to build the feature cache")
         return 1
+    for tag in ("train", "valid"):
+        n = shards(cache, tag)
+        print(f"  {tag}: {len(n)} shard(s)"
+              f"{'' if n else '  (missing -- push anyway, pull will rebuild it)'}")
 
     size = dir_size(cache)
     print(f"uploading {cache} ({human(size)}) -> {args.repo}")
@@ -77,10 +90,12 @@ def pull(args) -> int:
         local_dir=str(cache),
         max_workers=args.workers,
     )
-    for split in ("train", "valid"):
-        d = cache / split
-        print(f"  {split}: {'ok' if d.exists() else 'MISSING'} "
-              f"({human(dir_size(d)) if d.exists() else '-'})")
+    for tag in ("train", "valid"):
+        found = shards(cache, tag)
+        size = sum(f.stat().st_size for f in found)
+        print(f"  {tag}: {len(found)} shard(s) "
+              f"{human(size) if found else 'MISSING'}"
+              f"{'' if (cache/f'{tag}.json').exists() else '  (no manifest!)'}")
     print("\ntraining will now reuse these instead of extracting -- but only if "
           "the cache key matches (model, langs, valid_frac, seed, min_s/max_s, "
           "vocab). A mismatch rebuilds and prints both keys.")
