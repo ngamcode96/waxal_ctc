@@ -111,18 +111,26 @@ from the Hub and transcribes the Phase 1 test audio (~1.3 GB download).
 Needs `HF_TOKEN` in Add-ons → Secrets if the model repo is private.
 """))
     cells.append(code("""
-# Change --model to point at a different repo or checkpoint.
+# The only thing to change: which model to score with.
+#   ngia/ctc-v1     epoch 5, validation 0.1617   <- best so far
+#   ngia/ctc-v2     full-data run, epoch 2, 0.1747
+#   ngia/ctc-v3     v1 + speed perturbation
+MODEL = "ngia/ctc-v2"
+OUT = "/kaggle/working/submission.csv"
+"""))
+    cells.append(code("""
 !python scripts/infer.py \\
-    --model ngia/ctc-v1 \\
+    --model {MODEL} \\
     --phase 1 \\
     --sample-submission /kaggle/input/waxal-csvs/SampleSubmission.csv \\
-    --out /kaggle/working/submission.csv \\
+    --out {OUT} \\
     --batch-size 16
 """))
     cells.append(code("""
 import pandas as pd
-sub = pd.read_csv("/kaggle/working/submission.csv", escapechar="\\\\")
-print(sub.shape, list(sub.columns))
+sub = pd.read_csv(OUT, escapechar="\\\\")
+print(f"{MODEL}: {sub.shape} {list(sub.columns)}")
+assert list(sub.columns) == ["ID", "Target"], sub.columns
 empty = (sub.Target.fillna("").str.strip() == "").sum()
 print(f"empty targets: {empty}/{len(sub)}")
 # Degenerate CTC output ("Muta a a a a") shows up as repeated single letters.
