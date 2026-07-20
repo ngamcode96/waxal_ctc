@@ -52,32 +52,70 @@ def is_degenerate(text: str) -> bool:
     return False
 
 
+def frame_batches(ds, max_frames: int, max_count: int, max_s: float):
+    """Group clips so each batch has a bounded total length, not a fixed count.
+
+    The unlabeled pool is unfiltered -- filter_usable only ever runs on labeled
+    data -- so it contains clips far longer than anything in training. With a
+    fixed batch size one of those blows up attention memory no matter how small
+    the batch is. Budgeting frames instead means a long clip simply becomes its
+    own batch, and clips over max_s are skipped entirely since training would
+    drop them anyway.
+    """
+    buf, frames, skipped = [], 0, 0
+    for row in ds:
+        arr, sr = wdata.audio_array(row["audio"])
+        dur = len(arr) / sr
+        if dur > max_s:
+            skipped += 1
+            continue
+        n = len(arr) // 320                     # ~50 frames/sec after stride
+        if buf and (frames + n > max_frames or len(buf) >= max_count):
+            yield buf
+            buf, frames = [], 0
+        buf.append((row["id"], row["language"], arr))
+        frames += n
+    if buf:
+        yield buf
+    if skipped:
+        print(f"  skipped {skipped:,} clips over {max_s}s")
+
+
 @torch.no_grad()
-def transcribe(ds, model, processor, device, batch_size: int):
-    """Returns (ids, texts, confidences). Confidence is mean per-frame max prob."""
+def transcribe(ds, model, processor, device, max_frames, max_count, max_s):
+    """Returns (ids, langs, texts, confidences)."""
     model.eval().to(device)
-    ids, texts, confs = [], [], []
-    for start in range(0, len(ds), batch_size):
-        rows = ds[start:start + batch_size]
-        arrays = [wdata.audio_array(a)[0] for a in rows["audio"]]
+    ids, langs, texts, confs = [], [], [], []
+    done = 0
+    for batch in frame_batches(ds, max_frames, max_count, max_s):
+        arrays = [a for _, _, a in batch]
         feats = processor(arrays, sampling_rate=wdata.SR,
                           return_tensors="pt", padding=True).to(device)
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
-                            enabled=device.type == "cuda"):
-            logits = model(**feats).logits
+        try:
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                                enabled=device.type == "cuda"):
+                logits = model(**feats).logits
+        except torch.OutOfMemoryError:
+            # A single clip can still exceed memory; drop it rather than lose
+            # the whole shard, and report it so the budget can be tuned.
+            torch.cuda.empty_cache()
+            print(f"  OOM on a batch of {len(batch)} "
+                  f"({sum(len(a)//320 for a in arrays):,} frames) -- skipped")
+            continue
 
         probs = logits.float().softmax(-1)
-        # Mean of the best probability per frame: near 1.0 when the model is
-        # decisive at every step, lower when it is hedging across symbols.
         conf = probs.max(-1).values.mean(-1).cpu().numpy()
         hyps = processor.batch_decode(logits.argmax(-1).cpu().numpy())
+        del logits, probs, feats
 
-        ids.extend(rows["id"])
+        ids.extend(i for i, _, _ in batch)
+        langs.extend(l for _, l, _ in batch)
         texts.extend(hyps)
         confs.extend(conf.tolist())
-        if start % (batch_size * 25) == 0:
-            print(f"  {min(start + batch_size, len(ds)):,}/{len(ds):,}", flush=True)
-    return ids, texts, confs
+        done += len(batch)
+        if done % 500 < len(batch):
+            print(f"  {done:,}/{len(ds):,}", flush=True)
+    return ids, langs, texts, confs
 
 
 def main() -> int:
@@ -89,7 +127,15 @@ def main() -> int:
                          "(~0.5GB each)")
     ap.add_argument("--langs", nargs="+", default=list(wdata.LANGS))
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--batch-size", type=int, default=16)
+    ap.add_argument("--batch-size", type=int, default=16,
+                    help="upper bound on clips per batch")
+    ap.add_argument("--max-batch-frames", type=int, default=8000,
+                    help="total frames per batch (~50/sec). This, not "
+                         "--batch-size, is what prevents OOM: 8000 suits a T4, "
+                         "24000 an A100")
+    ap.add_argument("--max-s", type=float, default=30.0,
+                    help="skip clips longer than this; the unlabeled pool is "
+                         "unfiltered and training would drop them anyway")
     ap.add_argument("--min-conf", type=float, default=0.0,
                     help="drop rows below this confidence (0 keeps everything; "
                          "filter later once you can see the distribution)")
@@ -104,8 +150,10 @@ def main() -> int:
     ds = wdata.load_unlabeled(tuple(args.langs), tuple(args.shards))
     print(f"pseudo-labeling {len(ds):,} unlabeled clips on {device}")
 
-    ids, texts, confs = transcribe(ds, model, processor, device, args.batch_size)
-    df = pd.DataFrame({"id": ids, "language": ds["language"],
+    ids, langs, texts, confs = transcribe(
+        ds, model, processor, device,
+        args.max_batch_frames, args.batch_size, args.max_s)
+    df = pd.DataFrame({"id": ids, "language": langs,
                        "transcription": texts, "confidence": confs})
 
     df["words"] = df.transcription.str.split().str.len()
