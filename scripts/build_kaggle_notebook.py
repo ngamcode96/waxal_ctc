@@ -226,6 +226,50 @@ again. On a T4 expect roughly 25–35 minutes per 4,000 clips.
     --out /kaggle/working/pseudo_00.csv \\
     --batch-size 16
 """))
+    cells.append(md("""
+### Using both T4s
+
+Kaggle gives two GPUs. Rather than `DataParallel` — which splits each batch and
+pays a gather on every step — give each GPU its own shards and concatenate the
+CSVs. That scales near-linearly and needs no code changes.
+
+Caveat: the instance has only 4 CPU cores and audio decoding is CPU-bound, so
+expect ~1.6x rather than a clean 2x.
+"""))
+    cells.append(code("""
+import os, subprocess, time
+
+JOBS = [("0", ["0", "1"], "/kaggle/working/pseudo_gpu0.csv"),
+        ("1", ["2", "3"], "/kaggle/working/pseudo_gpu1.csv")]
+
+procs = []
+for gpu, shards, out in JOBS:
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": gpu}
+    cmd = ["python", "scripts/pseudo_label.py",
+           "--model", "ngia/ctc-v2-avg", "--shards", *shards,
+           "--out", out, "--batch-size", "16"]
+    log = open(out.replace(".csv", ".log"), "w")
+    procs.append((subprocess.Popen(cmd, env=env, stdout=log, stderr=log), out, log))
+    print(f"GPU {gpu}: shards {shards} -> {out}")
+
+t0 = time.time()
+for p, out, log in procs:
+    p.wait(); log.close()
+    print(f"{out}: exit {p.returncode}  ({time.time()-t0:.0f}s elapsed)")
+"""))
+    cells.append(code("""
+!tail -25 /kaggle/working/pseudo_gpu0.log
+"""))
+    cells.append(code("""
+import pandas as pd, glob
+parts = [pd.read_csv(f) for f in sorted(glob.glob("/kaggle/working/pseudo_gpu*.csv"))]
+p = pd.concat(parts, ignore_index=True)
+# Shards are disjoint, but a rerun could double up -- make that impossible.
+before = len(p)
+p = p.drop_duplicates(subset="id")
+print(f"{before:,} rows -> {len(p):,} after dedup by id")
+p.to_csv("/kaggle/working/pseudo_00.csv", index=False)
+"""))
     cells.append(code("""
 import pandas as pd
 p = pd.read_csv("/kaggle/working/pseudo_00.csv")
