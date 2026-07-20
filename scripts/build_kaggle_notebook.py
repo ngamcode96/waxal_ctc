@@ -200,6 +200,56 @@ Note the separate `--cache-dir`: perturbed features are a different (3x larger,
 """))
 
     cells.append(md("""
+## 2e. Pseudo-labelling the unlabeled pool
+
+The labeled set is ~180 hours; the unlabeled pool is ~78 GB across the three
+languages. Transcribing it with our best model and training on the confident
+outputs is the one remaining technique with the right order of magnitude —
+augmentation and checkpoint averaging give 5–10% relative, self-training can
+give 20–30%.
+
+Output is a small CSV (id, language, transcription, confidence), **not**
+features: re-extracting features on the training GPU is far cheaper than moving
+~10 GB of arrays off Kaggle.
+
+Nothing here goes near the test split — the unlabeled pool has no transcriptions
+at all, so there is no label to leak.
+
+Each shard is ~0.5 GB per language. Start with 2 shards to see the confidence
+distribution before committing a whole session, then raise `--shards` and run
+again. On a T4 expect roughly 25–35 minutes per 4,000 clips.
+"""))
+    cells.append(code("""
+!python scripts/pseudo_label.py \\
+    --model ngia/ctc-v2-avg \\
+    --shards 0 1 \\
+    --out /kaggle/working/pseudo_00.csv \\
+    --batch-size 16
+"""))
+    cells.append(code("""
+import pandas as pd
+p = pd.read_csv("/kaggle/working/pseudo_00.csv")
+print(p.shape)
+print(p.groupby("language").confidence.describe()[["count","25%","50%","75%"]])
+# Pick a threshold from this: high confidence means the model was decisive at
+# every frame, which correlates with the transcription being right.
+for q in (0.5, 0.6, 0.7, 0.8):
+    print(f"  conf >= {q}: {(p.confidence >= q).sum():,} rows "
+          f"({100*(p.confidence >= q).mean():.0f}%)")
+p.sort_values("confidence", ascending=False).head(3)[["language","confidence","transcription"]]
+"""))
+    cells.append(code("""
+# Push to the Hub so the training pod can pull it.
+from huggingface_hub import HfApi
+api = HfApi()
+api.create_repo("ngia/waxal-pseudo", repo_type="dataset", private=True, exist_ok=True)
+api.upload_file(path_or_fileobj="/kaggle/working/pseudo_00.csv",
+                path_in_repo="pseudo_00.csv",
+                repo_id="ngia/waxal-pseudo", repo_type="dataset")
+print("pushed -> https://huggingface.co/datasets/ngia/waxal-pseudo")
+"""))
+
+    cells.append(md("""
 ## 3. Smoke test
 
 A few hundred rows end-to-end first. The full run costs hours; a typo shouldn't

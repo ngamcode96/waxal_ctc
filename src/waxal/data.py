@@ -100,6 +100,28 @@ def load_labeled(langs=LANGS, splits=("train", "validation"), num_proc: int = 1,
     return ds.cast_column("audio", datasets.Audio(sampling_rate=SR))
 
 
+def load_unlabeled(langs=LANGS, shards: tuple[int, ...] = (0,), num_proc: int = 1):
+    """Audio from the unlabeled pool, for pseudo-labeling.
+
+    ~78GB across the three languages, so `shards` selects which parquet files to
+    pull -- one shard per language is roughly 0.5GB. These clips have no
+    transcription at all, so unlike the test split there is nothing to leak.
+    """
+    parts = []
+    for lang in langs:
+        files = [f"data/ASR/{lang}/{lang}-unlabeled-{i:05d}.parquet"
+                 for i in shards]
+        ds = datasets.load_dataset(
+            HF_REPO, data_files={"u": files}, split="u",
+            num_proc=num_proc if num_proc and num_proc > 1 else None,
+        )
+        keep = [c for c in ds.column_names if c in ("id", "audio", "language")]
+        ds = ds.remove_columns([c for c in ds.column_names if c not in keep])
+        parts.append(ds)
+    ds = datasets.concatenate_datasets(parts)
+    return ds.cast_column("audio", datasets.Audio(sampling_rate=SR))
+
+
 def load_test_audio(langs=LANGS, num_proc: int = 1):
     """Phase 1 test *audio only* -- the transcription column is dropped on load.
 
