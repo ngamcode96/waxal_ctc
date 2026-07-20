@@ -441,6 +441,16 @@ def main() -> None:
     ap.add_argument("--gradient-checkpointing", default=None,
                     action=argparse.BooleanOptionalAction,
                     help="default: off when the GPU has >40GB, on otherwise")
+    ap.add_argument("--pseudo-csv", type=str, default="",
+                    help="CSV from pseudo_label.py (id, language, transcription, "
+                         "confidence). Appended to the training split only")
+    ap.add_argument("--pseudo-shards", type=int, nargs="+", default=[0],
+                    help="unlabeled shards the pseudo-labels came from -- must "
+                         "cover the labelling run or ids will not be found")
+    ap.add_argument("--pseudo-min-conf", type=float, default=0.0,
+                    help="drop pseudo-labels below this confidence")
+    ap.add_argument("--pseudo-max", type=int, default=0,
+                    help="keep only the N most confident pseudo-labels")
     ap.add_argument("--in-memory", action="store_true",
                     help="extract features into RAM, never touching a filesystem. "
                          "~8.3GB for this dataset. Use when storage is unreliable "
@@ -529,6 +539,15 @@ def main() -> None:
         "model": MODEL_ID, "langs": list(wdata.LANGS), "sr": wdata.SR,
         "valid_frac": args.valid_frac, "seed": args.seed, "limit": args.limit,
         "min_s": args.min_s, "max_s": args.max_s,
+        # Pseudo-labels change which rows are extracted, so they belong in the
+        # cache key -- otherwise a run with different filtering silently reuses
+        # features built from a different training set.
+        # A list, not a tuple: the key is round-tripped through JSON in the
+        # manifest, which turns tuples into lists -- a tuple here would never
+        # compare equal on reload and would rebuild the cache every run.
+        "pseudo": [Path(args.pseudo_csv).name if args.pseudo_csv else None,
+                   args.pseudo_min_conf, args.pseudo_max,
+                   list(args.pseudo_shards) if args.pseudo_csv else None],
     }
 
     cached = load_from_cache_only(args, key_base)
@@ -564,6 +583,55 @@ def main() -> None:
                     valid_refs, valid_langs)
 
 
+def attach_pseudo(train_ds, args):
+    """Append pseudo-labeled clips to the training set.
+
+    Appended to `train` only, after the speaker-disjoint split has been made.
+    Putting machine-generated transcripts into validation would mean scoring the
+    model against its own past output, which measures self-consistency rather
+    than accuracy.
+
+    The unlabeled pool has no reference transcriptions at all, so nothing here
+    can leak: these are our own predictions being fed back as targets.
+    """
+    import pandas as pd
+
+    df = pd.read_csv(args.pseudo_csv)
+    n0 = len(df)
+    df = df[df.confidence >= args.pseudo_min_conf]
+    if args.pseudo_max:
+        df = df.nlargest(args.pseudo_max, "confidence")
+    print(f"pseudo-labels: {n0:,} -> {len(df):,} "
+          f"(conf >= {args.pseudo_min_conf}"
+          f"{f', top {args.pseudo_max:,}' if args.pseudo_max else ''})")
+    if df.empty:
+        print("  nothing survives the filter; training on labeled data alone")
+        return train_ds
+
+    ids = set(df.id)
+    uds = wdata.load_unlabeled(shards=tuple(args.pseudo_shards),
+                               num_proc=args.load_proc)
+    uds = uds.filter(lambda i: i in ids, input_columns="id",
+                     desc="selecting pseudo clips")
+    print(f"  matched {len(uds):,} clips in shards {args.pseudo_shards}")
+    if len(uds) < len(df):
+        print(f"  WARNING: {len(df) - len(uds):,} ids not found -- "
+              f"--pseudo-shards probably does not cover the labelling run")
+
+    text = dict(zip(df.id, df.transcription))
+    uds = uds.map(lambda r: {"transcription": text[r["id"]]},
+                  desc="attaching transcriptions")
+    uds = wdata.filter_usable(uds, min_s=args.min_s, max_s=args.max_s)
+    print(f"  {len(uds):,} usable after the {args.min_s}-{args.max_s}s filter")
+
+    cols = ["audio", "transcription", "language"]
+    combined = datasets.concatenate_datasets(
+        [train_ds.select_columns(cols), uds.select_columns(cols)])
+    print(f"  train {len(train_ds):,} -> {len(combined):,} "
+          f"({100*len(uds)/len(combined):.0f}% pseudo)")
+    return combined
+
+
 def build_from_source(args, key_base: dict):
     """Download, filter, split, and extract features from the source dataset."""
     print("loading labeled data (train+validation only; test is off-limits)")
@@ -596,6 +664,9 @@ def build_from_source(args, key_base: dict):
     print("building speaker-disjoint validation split")
     split = wdata.speaker_disjoint_split(ds, args.valid_frac, args.seed)
     print(f"  {split}")
+
+    if args.pseudo_csv:
+        split.train = attach_pseudo(split.train, args)
 
     vocab = build_vocab(split.train["transcription"])
     tokenizer = tokenizer_from_vocab(vocab, args.output_dir)
