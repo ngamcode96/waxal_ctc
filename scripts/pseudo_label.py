@@ -54,27 +54,33 @@ def is_degenerate(text: str) -> bool:
 
 
 def extract(ds, processor, num_proc: int, max_s: float):
-    """Decode and extract features in parallel, dropping over-long clips.
+    """Decode and extract features in parallel, then drop over-long clips.
 
-    Decoding one clip at a time leaves the GPU idle -- it is CPU work, and there
-    is one core doing it. Training reaches 187 clips/s with num_proc=16 doing
-    exactly this, so pseudo-labelling should too.
+    Decoding one clip at a time leaves the GPU idle -- it is CPU work with one
+    core doing it. Training reaches 187 clips/s with num_proc=16 doing exactly
+    this, so pseudo-labelling should too.
+
+    Long clips are filtered *after* extraction rather than skipped inside the
+    map. Returning a placeholder for skipped rows gives Arrow two different
+    types for the same column (halffloat vs double) and the shards refuse to
+    concatenate. Extracting a few over-long clips and discarding them is cheap
+    by comparison.
     """
     def fn(row):
         arr, sr = wdata.audio_array(row["audio"])
-        if len(arr) / sr > max_s:
-            return {"input_features": [], "length": 0,
-                    "uid": row["id"], "lang": row["language"]}
         f = processor(arr, sampling_rate=sr).input_features[0]
         return {"input_features": np.asarray(f, dtype=np.float16),
                 "length": len(f), "uid": row["id"], "lang": row["language"]}
 
     out = ds.map(fn, remove_columns=ds.column_names, num_proc=num_proc,
                  writer_batch_size=100, desc="extracting features")
+    cap = int(max_s * 50)          # ~50 frames per second
     before = len(out)
-    out = out.filter(lambda n: n > 0, input_columns="length")
+    out = out.filter(lambda n: 0 < n <= cap, input_columns="length",
+                     desc=f"dropping clips over {max_s}s")
     if before != len(out):
-        print(f"  dropped {before - len(out):,} clips over {max_s}s")
+        print(f"  dropped {before - len(out):,} clips over {max_s}s "
+              f"({cap} frames)")
     return out
 
 
