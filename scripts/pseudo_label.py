@@ -17,8 +17,19 @@ all, so there is no label to leak.
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
+
+# Must precede the torch/numpy imports: they read these at import time.
+#
+# Feature extraction runs N worker processes, and each would otherwise start
+# torch/OpenMP with one thread per core -- ~256 threads on 16 cores. Measured
+# here: 6.87 examples/s without this, against the 187 examples/s training gets
+# doing identical work. Same fix as train_ctc.py, which this script never got.
+for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -66,6 +77,10 @@ def extract(ds, processor, num_proc: int, max_s: float):
     concatenate. Extracting a few over-long clips and discarding them is cheap
     by comparison.
     """
+    # Belt and braces: covers torch regardless of import order. Forked workers
+    # inherit it, and the GPU pass afterwards does not need CPU threads.
+    torch.set_num_threads(1)
+
     def fn(row):
         arr, sr = wdata.audio_array(row["audio"])
         f = processor(arr, sampling_rate=sr).input_features[0]
