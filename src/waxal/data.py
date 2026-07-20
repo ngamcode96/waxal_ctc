@@ -193,7 +193,8 @@ def speaker_disjoint_split(ds, valid_frac: float = 0.06, seed: int = 42) -> Spli
     return Split(train=ds.select(idx_t), valid=ds.select(idx_v))
 
 
-def filter_usable(ds, min_s: float = 0.5, max_s: float = 30.0, min_chars: int = 3):
+def filter_usable(ds, min_s: float = 0.5, max_s: float = 30.0, min_chars: int = 3,
+                  num_proc: int = 1):
     """Drop rows that would waste compute or destabilize CTC.
 
     CTC requires the target to be no longer than the encoder output, so clips
@@ -214,4 +215,8 @@ def filter_usable(ds, min_s: float = 0.5, max_s: float = 30.0, min_chars: int = 
         # w2v-BERT downsamples ~2x per 10ms frame -> ~25 frames/sec of output.
         return len(txt) <= dur * 25
 
-    return ds.filter(ok, desc="filtering usable clips")
+    # Reading a duration decodes the clip, so this is as expensive as feature
+    # extraction and needs the same parallelism -- it ran at 52 clips/s
+    # single-process against 187 for the extraction that follows it.
+    return ds.filter(ok, desc="filtering usable clips",
+                     num_proc=num_proc if num_proc and num_proc > 1 else None)

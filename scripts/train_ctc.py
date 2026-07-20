@@ -52,6 +52,32 @@ MODEL_ID = "facebook/w2v-bert-2.0"
 HUB_USER = "ngia"
 
 
+def vocab_from_init(init_from: str) -> dict[str, int] | None:
+    """The vocabulary of the checkpoint we are warm-starting from.
+
+    Rebuilding the vocab from the training data gives a different alphabet
+    whenever the data changes -- adding pseudo-labels or changing --max-s both
+    shift which characters appear. The CTC head is sized by the vocabulary, so a
+    single extra symbol makes the checkpoint unloadable (86 vs 87 outputs).
+
+    Characters outside this vocabulary become [UNK], which is correct: the model
+    physically cannot emit a symbol its output layer has no slot for.
+    """
+    p = Path(init_from)
+    for cand in (p / "vocab.json", p.parent / "vocab.json"):
+        if cand.exists():
+            return json.loads(cand.read_text())
+    if "/" in init_from and not p.exists():
+        try:
+            from huggingface_hub import hf_hub_download
+            return json.loads(
+                Path(hf_hub_download(init_from, "vocab.json")).read_text())
+        except Exception as e:
+            print(f"could not fetch vocab.json from {init_from}: "
+                  f"{type(e).__name__}: {e}")
+    return None
+
+
 def build_vocab(texts: list[str]) -> dict[str, int]:
     chars = sorted({c for t in texts for c in clean(t)})
     # "|" stands in for space so the tokenizer can treat it as a normal symbol.
@@ -673,7 +699,17 @@ def build_from_source(args, key_base: dict):
     if args.pseudo_csv:
         split.train = attach_pseudo(split.train, args)
 
-    vocab = build_vocab(split.train["transcription"])
+    vocab = vocab_from_init(args.init_from) if args.init_from else None
+    if vocab is not None:
+        built = build_vocab(split.train["transcription"])
+        extra = sorted(set(built) - set(vocab))
+        print(f"vocab from {args.init_from}: {len(vocab)} symbols "
+              f"(data would give {len(built)})")
+        if extra:
+            print(f"  {len(extra)} symbol(s) in the data but not the checkpoint, "
+                  f"mapped to [UNK]: {extra}")
+    else:
+        vocab = build_vocab(split.train["transcription"])
     tokenizer = tokenizer_from_vocab(vocab, args.output_dir)
     fe = transformers.AutoFeatureExtractor.from_pretrained(MODEL_ID)
     processor = transformers.Wav2Vec2BertProcessor(feature_extractor=fe, tokenizer=tokenizer)
