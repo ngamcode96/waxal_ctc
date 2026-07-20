@@ -139,6 +139,17 @@ def load_from_cache_only(args, key_base: dict):
         print("cached manifest predates vocab storage; rebuilding from source")
         return None
 
+    if args.init_from:
+        # The cached labels are token ids under the cached vocabulary. Warm
+        # starting forces the checkpoint's vocabulary, so a cache built with a
+        # different one has labels that mean something else -- and the CTC head
+        # would not load anyway (86 outputs vs 87).
+        init_vocab = vocab_from_init(args.init_from)
+        if init_vocab is not None and init_vocab != vocab:
+            print(f"cached labels use a {len(vocab)}-symbol vocabulary but "
+                  f"{args.init_from} has {len(init_vocab)}; rebuilding features")
+            return None
+
     print(f"reusing cached features from {args.cache_dir} (source not needed)")
     tokenizer = tokenizer_from_vocab(vocab, args.output_dir)
     fe = transformers.AutoFeatureExtractor.from_pretrained(MODEL_ID)
