@@ -21,8 +21,13 @@ EMBED = [
     "src/waxal/hw.py",
     "src/waxal/data.py",
     "scripts/train_ctc.py",
-    "scripts/infer.py",
+    "scripts/infer.py",            # eval_checkpoint and pseudo_label import this
     "scripts/bench.py",
+    "scripts/eval_checkpoint.py",
+    "scripts/sync_features.py",
+    "scripts/pseudo_label.py",
+    "scripts/push_checkpoint.py",
+    "scripts/average_checkpoints.py",
 ]
 
 
@@ -423,8 +428,32 @@ sub.head()
     }
 
 
+def check_referenced_scripts(nb: dict) -> list[str]:
+    """Every scripts/X.py a cell invokes must also be written by a cell.
+
+    Missing one produces "No such file or directory" only when that cell runs,
+    which in a long notebook can be an hour in. pseudo_label.py and
+    sync_features.py were both referenced but not embedded.
+    """
+    import re
+
+    written = {rel for rel in EMBED}
+    referenced = set()
+    for cell in nb["cells"]:
+        src = "".join(cell["source"])
+        if src.startswith("%%writefile"):
+            continue
+        referenced.update(re.findall(r"(scripts/[a-z_]+\.py)", src))
+    return sorted(referenced - written)
+
+
 if __name__ == "__main__":
     OUT.parent.mkdir(parents=True, exist_ok=True)
     nb = build()
+    missing = check_referenced_scripts(nb)
+    if missing:
+        raise SystemExit(
+            f"these scripts are invoked by a cell but never written to disk: "
+            f"{missing}\nadd them to EMBED")
     OUT.write_text(json.dumps(nb, indent=1, ensure_ascii=False))
     print(f"wrote {OUT}  ({len(nb['cells'])} cells)")
