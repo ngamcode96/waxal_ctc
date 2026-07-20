@@ -23,10 +23,10 @@ from pathlib import Path
 
 # Must precede the torch/numpy imports: they read these at import time.
 #
-# Feature extraction runs N worker processes, and each would otherwise start
+# Decoding runs in N DataLoader workers, and each would otherwise start
 # torch/OpenMP with one thread per core -- ~256 threads on 16 cores. Measured
 # here: 6.87 examples/s without this, against the 187 examples/s training gets
-# doing identical work. Same fix as train_ctc.py, which this script never got.
+# doing identical work. Same fix as train_ctc.py.
 for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
            "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(_v, "1")
@@ -64,93 +64,71 @@ def is_degenerate(text: str) -> bool:
     return False
 
 
-def extract(ds, processor, num_proc: int, max_s: float):
-    """Decode and extract features in parallel, then drop over-long clips.
+class ClipDataset(torch.utils.data.Dataset):
+    """Decode and extract one clip. Parallelism comes from DataLoader workers.
 
-    Decoding one clip at a time leaves the GPU idle -- it is CPU work with one
-    core doing it. Training reaches 187 clips/s with num_proc=16 doing exactly
-    this, so pseudo-labelling should too.
-
-    Long clips are filtered *after* extraction rather than skipped inside the
-    map. Returning a placeholder for skipped rows gives Arrow two different
-    types for the same column (halffloat vs double) and the shards refuse to
-    concatenate. Extracting a few over-long clips and discarding them is cheap
-    by comparison.
+    Deliberately not datasets.map(num_proc=...): that writes Arrow shards,
+    fingerprints the function, and leaves worker pools behind when it fails --
+    all of which stalled this script repeatedly. A DataLoader worker is a plain
+    forked process that dies with its parent and writes nothing.
     """
-    # Belt and braces: covers torch regardless of import order. Forked workers
-    # inherit it, and the GPU pass afterwards does not need CPU threads.
-    torch.set_num_threads(1)
 
-    def fn(row):
+    def __init__(self, ds, processor, max_s: float):
+        self.ds, self.processor, self.max_s = ds, processor, max_s
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, i):
+        row = self.ds[i]
         arr, sr = wdata.audio_array(row["audio"])
-        f = processor(arr, sampling_rate=sr).input_features[0]
-        return {"input_features": np.asarray(f, dtype=np.float16),
-                "length": len(f), "uid": row["id"], "lang": row["language"]}
+        if len(arr) / sr > self.max_s:
+            return None                      # dropped in collate
+        feats = self.processor(arr, sampling_rate=sr).input_features[0]
+        return {"uid": row["id"], "lang": row["language"],
+                "feats": np.asarray(feats, dtype=np.float32)}
 
-    out = ds.map(fn, remove_columns=ds.column_names, num_proc=num_proc,
-                 writer_batch_size=100, desc="extracting features")
-    cap = int(max_s * 50)          # ~50 frames per second
-    before = len(out)
-    out = out.filter(lambda n: 0 < n <= cap, input_columns="length",
-                     desc=f"dropping clips over {max_s}s")
-    if before != len(out):
-        print(f"  dropped {before - len(out):,} clips over {max_s}s "
-              f"({cap} frames)")
-    return out
+
+def collate(items):
+    return [x for x in items if x is not None]
 
 
 @torch.no_grad()
-def transcribe(feats_ds, model, processor, device, max_frames, max_count):
-    """Run the model over pre-extracted features, budgeting frames per batch.
-
-    Sorted by length so each batch is near-uniform: minimal padding, and a long
-    clip lands with other long clips instead of inflating a batch of short ones.
-    """
+def transcribe(ds, model, processor, device, batch_size, workers, max_s):
+    """Stream clips through the model. Returns (ids, langs, texts, confidences)."""
     model.eval().to(device)
-    # Read the length column once. Sorting with `feats_ds[i]["length"]` would
-    # materialize every row -- the full feature array included -- to read a
-    # single integer, which stalls for minutes on a few thousand clips.
-    lengths = feats_ds["length"]
-    order = sorted(range(len(lengths)), key=lambda i: lengths[i])
+    loader = torch.utils.data.DataLoader(
+        ClipDataset(ds, processor, max_s), batch_size=batch_size,
+        num_workers=workers, collate_fn=collate, shuffle=False)
 
     ids, langs, texts, confs = [], [], [], []
-    batch, frames = [], 0
     done = 0
-
-    def flush(idx):
-        nonlocal done
-        if not idx:
-            return
-        rows = feats_ds[idx]
-        padded = processor.pad(
-            [{"input_features": np.asarray(f, dtype=np.float32)}
-             for f in rows["input_features"]],
-            padding=True, return_tensors="pt").to(device)
+    for batch in loader:
+        done += batch_size
+        if not batch:                    # whole batch was over max_s
+            continue
+        padded = processor.pad([{"input_features": b["feats"]} for b in batch],
+                               padding=True, return_tensors="pt").to(device)
         try:
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
                                 enabled=device.type == "cuda"):
                 logits = model(**padded).logits
         except torch.OutOfMemoryError:
             torch.cuda.empty_cache()
-            print(f"  OOM on {len(idx)} clips -- skipped")
-            return
+            print(f"  OOM on {len(batch)} clips -- skipped", flush=True)
+            continue
+
         probs = logits.float().softmax(-1)
         confs.extend(probs.max(-1).values.mean(-1).cpu().numpy().tolist())
         texts.extend(processor.batch_decode(logits.argmax(-1).cpu().numpy()))
-        ids.extend(rows["uid"])
-        langs.extend(rows["lang"])
-        done += len(idx)
-        if done % 1000 < len(idx):
-            print(f"  {done:,}/{len(feats_ds):,}", flush=True)
+        ids.extend(b["uid"] for b in batch)
+        langs.extend(b["lang"] for b in batch)
+        del logits, probs, padded
 
-    for i in order:
-        n = lengths[i]
-        if batch and (frames + n > max_frames or len(batch) >= max_count):
-            flush(batch)
-            batch, frames = [], 0
-        batch.append(i)
-        frames += n
-    flush(batch)
+        if done % 500 < batch_size:
+            print(f"  {min(done, len(ds)):,}/{len(ds):,}", flush=True)
+    print(f"  transcribed {len(ids):,}; {len(ds) - len(ids):,} dropped "
+          f"(over {max_s}s or OOM)")
     return ids, langs, texts, confs
 
 
@@ -165,13 +143,9 @@ def main() -> int:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--batch-size", type=int, default=16,
                     help="upper bound on clips per batch")
-    ap.add_argument("--max-batch-frames", type=int, default=8000,
-                    help="total frames per batch (~50/sec). This, not "
-                         "--batch-size, is what prevents OOM: 8000 suits a T4, "
-                         "24000 an A100")
     ap.add_argument("--num-proc", type=int, default=8,
-                    help="parallel workers for audio decoding -- this, not the "
-                         "GPU, is what limits throughput")
+                    help="DataLoader workers for audio decoding -- this, not the "
+                         "GPU, is what limits throughput. 0 runs in-process")
     ap.add_argument("--max-s", type=float, default=30.0,
                     help="skip clips longer than this; the unlabeled pool is "
                          "unfiltered and training would drop them anyway")
@@ -189,11 +163,9 @@ def main() -> int:
     ds = wdata.load_unlabeled(tuple(args.langs), tuple(args.shards))
     print(f"pseudo-labeling {len(ds):,} unlabeled clips on {device}")
 
-    feats = extract(ds, processor, args.num_proc, args.max_s)
-    print(f"  {len(feats):,} clips ready")
     ids, langs, texts, confs = transcribe(
-        feats, model, processor, device,
-        args.max_batch_frames, args.batch_size)
+        ds, model, processor, device,
+        args.batch_size, args.num_proc, args.max_s)
     df = pd.DataFrame({"id": ids, "language": langs,
                        "transcription": texts, "confidence": confs})
 
