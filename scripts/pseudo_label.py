@@ -107,8 +107,11 @@ def transcribe(feats_ds, model, processor, device, max_frames, max_count):
     clip lands with other long clips instead of inflating a batch of short ones.
     """
     model.eval().to(device)
-    order = sorted(range(len(feats_ds)), key=lambda i: feats_ds[i]["length"])
+    # Read the length column once. Sorting with `feats_ds[i]["length"]` would
+    # materialize every row -- the full feature array included -- to read a
+    # single integer, which stalls for minutes on a few thousand clips.
     lengths = feats_ds["length"]
+    order = sorted(range(len(lengths)), key=lambda i: lengths[i])
 
     ids, langs, texts, confs = [], [], [], []
     batch, frames = [], 0
