@@ -313,7 +313,11 @@ def prepare(ds, processor, num_proc: int, speeds: tuple[float, ...] = (1.0,),
                 "length": len(feats),
             }
 
-        return ds.map(fn_single, remove_columns=ds.column_names, num_proc=num_proc,
+        # None, not 1: datasets still takes the multiprocessing path for
+        # num_proc=1, spawning a pool of one. None skips it entirely, which is
+        # what --num-proc 1 is for when you want no worker processes at all.
+        return ds.map(fn_single, remove_columns=ds.column_names,
+                      num_proc=num_proc if num_proc and num_proc > 1 else None,
                       writer_batch_size=writer_batch_size,
                       keep_in_memory=in_memory,
                       cache_file_name=None if in_memory else (
@@ -337,7 +341,8 @@ def prepare(ds, processor, num_proc: int, speeds: tuple[float, ...] = (1.0,),
         }
 
     # batched with a 1-row batch: lets each input emit len(speeds) output rows.
-    return ds.map(fn, remove_columns=ds.column_names, num_proc=num_proc,
+    return ds.map(fn, remove_columns=ds.column_names,
+                  num_proc=num_proc if num_proc and num_proc > 1 else None,
                   batched=True, batch_size=1,
                   writer_batch_size=writer_batch_size,
                   keep_in_memory=in_memory,
