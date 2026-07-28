@@ -15,6 +15,7 @@ Run:
 """
 
 import argparse
+import collections
 import json
 import os
 import sys
@@ -45,6 +46,7 @@ import transformers
 
 from waxal import data as wdata
 from waxal import hw
+from waxal import normalize
 from waxal.metric import score, score_by_language
 from waxal.normalize import clean
 
@@ -85,6 +87,85 @@ def build_vocab(texts: list[str]) -> dict[str, int]:
     vocab["[UNK]"] = len(vocab)
     vocab["[PAD]"] = len(vocab)          # doubles as the CTC blank
     return vocab
+
+
+def extend_vocab(base: dict[str, int], texts: list[str]) -> tuple[dict[str, int], list[str]]:
+    """Add symbols the data needs to a checkpoint's vocabulary, keeping its ids.
+
+    Adding languages to a warm start is not the same problem as adding data in
+    the same languages. Ethiopic script (amh, tir) contributes a few hundred
+    symbols the Latin checkpoint has no output slot for, and mapping them to
+    [UNK] -- which is what taking the checkpoint's vocabulary unchanged does --
+    makes those languages unlearnable rather than merely hard.
+
+    Existing ids must not move: the checkpoint's CTC head rows mean specific
+    symbols, and [PAD] doubles as the blank, so renumbering would silently
+    scramble every learned output. New symbols are therefore appended after the
+    highest existing id, and the head is grown to match (see extend_ctc_head).
+
+    One subtlety: Wav2Vec2CTCTokenizer appends <s> and </s> *after* vocab.json,
+    so appending here shifts those two up by one. Harmless -- infer.py notes they
+    carry no training signal and are never emitted -- but it is why the head must
+    be sized from the checkpoint's config.vocab_size, which counts them, and not
+    from len(vocab.json), which is two smaller.
+    """
+    vocab = dict(base)
+    fresh = sorted({c if c != " " else "|"
+                    for t in texts for c in clean(t)} - set(vocab))
+    nxt = max(vocab.values()) + 1
+    for i, c in enumerate(fresh):
+        vocab[c] = nxt + i
+    return vocab, fresh
+
+
+def parse_shards(tokens: list[str]) -> int | dict[str, int]:
+    """--shards 5 lin=0 sna=11  ->  {"default": 5, "lin": 0, "sna": 11}."""
+    if not tokens:
+        return 0
+    out: dict[str, int] = {}
+    for t in tokens:
+        if "=" in t:
+            lang, n = t.split("=", 1)
+            out[lang] = int(n)
+        else:
+            out["default"] = int(t)
+    return out if len(out) > 1 or "default" not in out else out["default"]
+
+
+def extend_ctc_head(model, new_size: int) -> None:
+    """Grow the CTC output layer in place, preserving the trained rows.
+
+    from_pretrained(vocab_size=bigger) raises on the size mismatch, and
+    ignore_mismatched_sizes=True reinitializes the whole head -- throwing away
+    exactly the part that already works. Copying the old weights into a larger
+    layer keeps every learned symbol and leaves only the new ones untrained.
+    """
+    import torch
+
+    old = model.lm_head
+    if old.out_features == new_size:
+        return
+    if old.out_features > new_size:
+        raise SystemExit(
+            f"checkpoint head has {old.out_features} outputs but the vocabulary "
+            f"is {new_size} -- shrinking would drop trained symbols")
+
+    head = torch.nn.Linear(old.in_features, new_size,
+                           bias=old.bias is not None)
+    with torch.no_grad():
+        # Small random init for the new rows; zeros would make every new symbol
+        # produce an identical logit and gradients that cannot separate them.
+        head.weight.normal_(mean=0.0, std=0.02)
+        if head.bias is not None:
+            head.bias.zero_()
+        head.weight[:old.out_features] = old.weight
+        if old.bias is not None:
+            head.bias[:old.out_features] = old.bias
+    head.to(old.weight.device, dtype=old.weight.dtype)
+    model.lm_head = head
+    model.config.vocab_size = new_size
+    print(f"CTC head {old.out_features} -> {new_size} outputs "
+          f"({new_size - old.out_features} new symbols, trained rows preserved)")
 
 
 def tokenizer_from_vocab(vocab: dict[str, int],
@@ -146,9 +227,29 @@ def load_from_cache_only(args, key_base: dict):
         # would not load anyway (86 outputs vs 87).
         init_vocab = vocab_from_init(args.init_from)
         if init_vocab is not None and init_vocab != vocab:
-            print(f"cached labels use a {len(vocab)}-symbol vocabulary but "
-                  f"{args.init_from} has {len(init_vocab)}; rebuilding features")
-            return None
+            # --extend-vocab makes them differ *by design*: the cache was built
+            # with the checkpoint's symbols plus whatever the new languages need,
+            # appended after the highest existing id. That is compatible, not
+            # stale -- every checkpoint symbol still means the same token id, so
+            # the cached labels are valid. Rejecting it here forced a full source
+            # reload (~20 GB) for a cache that was perfectly good.
+            extended = (args.extend_vocab
+                        and all(vocab.get(k) == v for k, v in init_vocab.items()))
+            if extended:
+                added = len(vocab) - len(init_vocab)
+                print(f"cache vocabulary extends {args.init_from} by {added} "
+                      f"symbol(s), ids unchanged -- compatible")
+            else:
+                print(f"cached labels use a {len(vocab)}-symbol vocabulary but "
+                      f"{args.init_from} has {len(init_vocab)}; rebuilding features")
+                if args.extend_vocab:
+                    moved = [k for k, v in init_vocab.items() if k in vocab
+                             and vocab[k] != v]
+                    if moved:
+                        print(f"  --extend-vocab given, but {len(moved)} symbol(s) "
+                              f"were renumbered, e.g. {moved[:5]} -- not an "
+                              f"extension")
+                return None
 
     print(f"reusing cached features from {args.cache_dir} (source not needed)")
     tokenizer = tokenizer_from_vocab(vocab, args.output_dir)
@@ -207,12 +308,16 @@ class LengthGroupedSampler(torch.utils.data.Sampler):
     """
 
     def __init__(self, lengths: list[int], batch_size: int, seed: int = 42,
-                 megabatch_mult: int = 50):
+                 megabatch_mult: int = 50, weights=None):
         self.lengths = lengths
         self.batch_size = batch_size
         self.megabatch_size = batch_size * megabatch_mult
         self.seed = seed
         self.epoch = 0
+        # Per-row sampling weights (see language_weights). When set, each epoch
+        # draws len(lengths) rows *with replacement* according to them, so the
+        # epoch costs the same wall-clock while its language composition shifts.
+        self.weights = weights
 
     def __len__(self) -> int:
         return len(self.lengths)
@@ -223,7 +328,12 @@ class LengthGroupedSampler(torch.utils.data.Sampler):
     def __iter__(self):
         g = torch.Generator()
         g.manual_seed(self.seed + self.epoch)
-        indices = torch.randperm(len(self.lengths), generator=g).tolist()
+        if self.weights is None:
+            indices = torch.randperm(len(self.lengths), generator=g).tolist()
+        else:
+            indices = torch.multinomial(
+                self.weights, num_samples=len(self.lengths),
+                replacement=True, generator=g).tolist()
 
         megabatches = [indices[i:i + self.megabatch_size]
                        for i in range(0, len(indices), self.megabatch_size)]
@@ -240,15 +350,50 @@ class LengthGroupedSampler(torch.utils.data.Sampler):
             yield from batches[b]
 
 
+def language_weights(languages: list[str], alpha: float) -> torch.Tensor:
+    """Per-row sampling weights that rebalance the languages.
+
+    Temperature sampling, as used for multilingual pretraining: a language with
+    natural share p is sampled at p**alpha, renormalized. alpha=1 leaves the data
+    as it is; alpha=0 makes every language equally likely regardless of size.
+
+    The problem this solves here is not capacity, it is attention. Measured
+    2026-07-28: with every language at full size, Acholi is 9.3% of the gradient
+    while being 30.4% of Phase 2, and lin+sna are 49% of the gradient for 4.6%.
+    Sampling with replacement keeps the epoch the same length, so this costs no
+    wall-clock -- it changes which rows the same number of steps sees.
+    """
+    counts = collections.Counter(languages)
+    n = sum(counts.values())
+    natural = {l: c / n for l, c in counts.items()}
+    scaled = {l: p ** alpha for l, p in natural.items()}
+    total = sum(scaled.values())
+    target = {l: s / total for l, s in scaled.items()}
+
+    print(f"--balance alpha={alpha}: resampling languages per epoch")
+    print(f"  {'lang':<6}{'rows':>8}{'natural':>10}{'balanced':>11}{'exposure':>11}")
+    for l in sorted(counts, key=lambda x: -counts[x]):
+        mult = target[l] / natural[l]
+        print(f"  {l:<6}{counts[l]:>8,}{100*natural[l]:>9.1f}%"
+              f"{100*target[l]:>10.1f}%{mult:>10.2f}x")
+
+    # Weight per row = that language's target share spread over its rows.
+    per_row = {l: target[l] / counts[l] for l in counts}
+    return torch.tensor([per_row[l] for l in languages], dtype=torch.double)
+
+
 class LengthGroupedTrainer(transformers.Trainer):
     """Trainer that uses LengthGroupedSampler when the dataset carries lengths."""
+
+    sample_weights = None      # set by build_and_train when --balance is on
 
     def _get_train_sampler(self, *args, **kwargs):
         ds = self.train_dataset
         if ds is None or "length" not in getattr(ds, "column_names", []):
             return super()._get_train_sampler(*args, **kwargs)
         return LengthGroupedSampler(
-            ds["length"], self.args.per_device_train_batch_size, self.args.seed
+            ds["length"], self.args.per_device_train_batch_size, self.args.seed,
+            weights=self.sample_weights,
         )
 
 
@@ -506,6 +651,36 @@ def main() -> None:
                     help="workers for dataset download/Arrow generation. Keep low: "
                          "it is I/O-bound, and high values make datasets' forked "
                          "workers fail with 'I/O operation on closed file'")
+    ap.add_argument("--langs", nargs="+", default=list(wdata.LANGS),
+                    help="languages to train on. 'all' expands to the 19 in the "
+                         "corpus. Phase 2 draws from more than the default three, "
+                         "and a three-language model caps at 0.359 on the "
+                         "leaderboard however good it gets")
+    ap.add_argument("--shards", nargs="+", default=[],
+                    help="cap parquet files per language, e.g. --shards 5 to take "
+                         "~40h each (a shard is ~8h), or --shards 5 lin=0 lug=0 "
+                         "sna=0 to cap the new languages while keeping the "
+                         "already-good three at full size. 0 means everything")
+    ap.add_argument("--balance", action="store_true",
+                    help="resample languages each epoch so a small language is "
+                         "not drowned out by a large one. Epoch length is "
+                         "unchanged, so this costs no wall-clock -- it changes "
+                         "which rows the same number of steps sees. Not part of "
+                         "the feature-cache key: toggling it reuses the cache")
+    ap.add_argument("--balance-alpha", type=float, default=0.5,
+                    help="temperature for --balance. 1.0 leaves the data as it "
+                         "is, 0.0 gives every language an equal share whatever "
+                         "its size. 0.5 is the usual multilingual choice")
+    ap.add_argument("--extract-only", action="store_true",
+                    help="build the feature cache and stop, without training. "
+                         "Extraction is CPU-bound, so run it somewhere free "
+                         "(Kaggle), push the cache, and let a rented GPU pull it "
+                         "and start training immediately")
+    ap.add_argument("--extend-vocab", action="store_true",
+                    help="with --init-from, append symbols the data needs to the "
+                         "checkpoint's vocabulary and grow the CTC head, instead "
+                         "of mapping them to [UNK]. Required when adding a "
+                         "language in a new script (amh and tir are Ethiopic)")
     ap.add_argument("--valid-frac", type=float, default=0.06)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--limit", type=int, default=0, help="debug: cap rows loaded")
@@ -561,6 +736,28 @@ def main() -> None:
                          "training set with faster/slower copies")
     args = ap.parse_args()
 
+    if len(args.langs) == 1 and args.langs[0] == "all":
+        args.langs = list(wdata.ALL_LANGS)
+    # Canonical order, so a cache extracted on one box is reusable on another
+    # whatever order the languages were typed in. This fixes the load order too,
+    # not just the key -- otherwise two different row orderings would share a key.
+    args.langs = sorted(set(args.langs))
+    unknown = [l for l in args.langs if l not in wdata.ALL_LANGS]
+    if unknown:
+        ap.error(f"unknown language(s) {unknown}; the corpus has "
+                 f"{list(wdata.ALL_LANGS)}")
+    # Must precede any clean() call: the alphabet decides what survives
+    # normalization, and training, evaluation and scoring all have to agree.
+    normalize.set_alphabet(args.langs)
+
+    ethiopic = [l for l in args.langs if l in wdata.ETHIOPIC_LANGS]
+    if ethiopic and args.init_from and not args.extend_vocab:
+        ap.error(
+            f"{ethiopic} are written in Ethiopic script, but --init-from without "
+            f"--extend-vocab keeps the checkpoint's Latin vocabulary and maps "
+            f"every Ethiopic character to [UNK] -- those languages could not be "
+            f"learned at all. Pass --extend-vocab, or drop them from --langs.")
+
     transformers.set_seed(args.seed)          # rules require reproducibility
 
     if args.gradient_checkpointing is None:
@@ -578,7 +775,12 @@ def main() -> None:
     # Learning rate and epochs are deliberately absent: they don't affect
     # features, so re-tuning them reuses the cache.
     key_base = {
-        "model": MODEL_ID, "langs": list(wdata.LANGS), "sr": wdata.SR,
+        # The languages actually loaded, not the module default: a 19-language
+        # run must not silently reuse the three-language feature cache.
+        "model": MODEL_ID, "langs": list(args.langs), "sr": wdata.SR,
+        # The parsed form, not the raw argv: "--shards 2 lug=0" and
+        # "--shards lug=0 2" describe the same dataset and must share a cache.
+        "shards": parse_shards(args.shards),
         "valid_frac": args.valid_frac, "seed": args.seed, "limit": args.limit,
         "min_s": args.min_s, "max_s": args.max_s,
         # Pseudo-labels change which rows are extracted, so they belong in the
@@ -619,6 +821,29 @@ def main() -> None:
     # here, every checkpoint's parent directory has what it needs.
     processor.save_pretrained(str(args.output_dir))
     print(f"processor -> {args.output_dir}")
+
+    if args.extract_only:
+        # Extraction is CPU-bound, so it belongs on whatever machine is cheapest
+        # rather than on a rented GPU. Stop here, push the cache, and let the
+        # GPU box pull it and go straight into training.
+        print(f"\n--extract-only: features are in {args.cache_dir}")
+        print(f"  train {len(train_ds):,} rows   valid {len(valid_ds):,} rows")
+        print("\nThe cache is only reusable by a run whose key matches. Use "
+              "EXACTLY these arguments on the training box:")
+        keep = ("langs", "shards", "init_from", "extend_vocab", "valid_frac",
+                "seed", "min_s", "max_s", "limit", "pseudo_csv")
+        parts = []
+        for k in keep:
+            v = getattr(args, k, None)
+            if v in (None, "", 0, False, []):
+                continue
+            flag = "--" + k.replace("_", "-")
+            parts.append(flag if v is True else
+                         f"{flag} {' '.join(map(str, v)) if isinstance(v, list) else v}")
+        print("  " + " \\\n  ".join(parts))
+        print("\npush it with:")
+        print(f"  python scripts/sync_features.py push --cache-dir {args.cache_dir}")
+        return
 
     tokenizer = processor.tokenizer
     build_and_train(args, processor, tokenizer, train_ds, valid_ds,
@@ -678,7 +903,8 @@ def build_from_source(args, key_base: dict):
     """Download, filter, split, and extract features from the source dataset."""
     print("loading labeled data (train+validation only; test is off-limits)")
     # With --limit, fetch one parquet shard per language instead of all ~12.6GB.
-    ds = wdata.load_labeled(num_proc=args.load_proc, shards=1 if args.limit else 0)
+    ds = wdata.load_labeled(tuple(args.langs), num_proc=args.load_proc,
+                            shards=1 if args.limit else parse_shards(args.shards))
     if args.limit:
         # Shuffle first: the shards concatenate language by language, so taking
         # the head would give an all-Lingala "smoke test" that never exercises
@@ -712,13 +938,23 @@ def build_from_source(args, key_base: dict):
 
     vocab = vocab_from_init(args.init_from) if args.init_from else None
     if vocab is not None:
-        built = build_vocab(split.train["transcription"])
+        texts = split.train["transcription"]
+        built = build_vocab(texts)
         extra = sorted(set(built) - set(vocab))
         print(f"vocab from {args.init_from}: {len(vocab)} symbols "
               f"(data would give {len(built)})")
-        if extra:
+        if extra and args.extend_vocab:
+            vocab, fresh = extend_vocab(vocab, texts)
+            shown = "".join(fresh[:40])
+            print(f"  --extend-vocab: appended {len(fresh)} symbol(s), "
+                  f"vocab now {len(vocab)}: {shown}"
+                  f"{'...' if len(fresh) > 40 else ''}")
+        elif extra:
             print(f"  {len(extra)} symbol(s) in the data but not the checkpoint, "
-                  f"mapped to [UNK]: {extra}")
+                  f"mapped to [UNK]: {extra[:40]}")
+            print("  pass --extend-vocab to give them their own outputs instead "
+                  "-- without it, any language in a script the checkpoint never "
+                  "saw cannot be learned at all")
     else:
         vocab = build_vocab(split.train["transcription"])
     tokenizer = tokenizer_from_vocab(vocab, args.output_dir)
@@ -758,6 +994,33 @@ def build_and_train(args, processor, tokenizer, train_ds, valid_ds,
     init_from = args.init_from or MODEL_ID
     if args.init_from:
         print(f"warm start from {args.init_from} (fresh optimizer and schedule)")
+
+    # When the vocabulary was extended, load the head at the checkpoint's size
+    # and grow it afterwards. Asking from_pretrained for the larger size raises,
+    # and ignore_mismatched_sizes would discard the trained head entirely.
+    #
+    # The head size is NOT len(vocab.json): Wav2Vec2CTCTokenizer appends <s> and
+    # </s> as added tokens, so the head is two rows larger than the file. Take it
+    # from the checkpoint's own config, which is authoritative -- guessing from
+    # vocab.json asks for 84 outputs against a checkpoint that has 86 and dies in
+    # from_pretrained with a MISMATCH report.
+    target_size = len(processor.tokenizer)
+    load_size = target_size
+    if args.init_from and args.extend_vocab:
+        try:
+            ckpt = transformers.AutoConfig.from_pretrained(args.init_from).vocab_size
+        except Exception as e:
+            raise SystemExit(
+                f"could not read vocab_size from {args.init_from}'s config "
+                f"({type(e).__name__}: {e}); needed to size the CTC head")
+        if ckpt < target_size:
+            load_size = ckpt
+            print(f"checkpoint head is {ckpt}; tokenizer wants {target_size}")
+        elif ckpt > target_size:
+            raise SystemExit(
+                f"{args.init_from} has {ckpt} outputs but the vocabulary is only "
+                f"{target_size} -- shrinking would drop trained symbols")
+
     model = transformers.Wav2Vec2BertForCTC.from_pretrained(
         init_from,
         attention_dropout=0.0, hidden_dropout=0.0, feat_proj_dropout=0.0,
@@ -771,8 +1034,10 @@ def build_and_train(args, processor, tokenizer, train_ds, valid_ds,
         ctc_loss_reduction="mean",
         add_adapter=True,
         pad_token_id=processor.tokenizer.pad_token_id,
-        vocab_size=len(processor.tokenizer),
+        vocab_size=load_size,
     )
+    if load_size != target_size:
+        extend_ctc_head(model, target_size)
 
     def compute_metrics(pred):
         ids = np.argmax(pred.predictions, axis=-1)
@@ -839,6 +1104,13 @@ def build_and_train(args, processor, tokenizer, train_ds, valid_ds,
         data_collator=Collator(processor),
         compute_metrics=compute_metrics,
     )
+    if args.balance:
+        if "language" not in train_ds.column_names:
+            raise SystemExit(
+                "--balance needs a 'language' column; this feature cache predates "
+                "it. Re-extract, or drop the flag.")
+        trainer.sample_weights = language_weights(
+            train_ds["language"], args.balance_alpha)
     resume = None
     if args.resume:
         last = transformers.trainer_utils.get_last_checkpoint(str(args.output_dir))

@@ -17,8 +17,53 @@ import datasets
 import numpy as np
 
 LANGS = ("lin", "lug", "sna")
+
+# The corpus holds 19 languages, not the three the challenge advertised. Phase 2
+# is drawn from more of them than LANGS: measured 2026-07-27, a model trained on
+# LANGS alone scores 0.138 on held-out lin/lug/sna but 0.585 on unseen Runyankole
+# and 0.662 on the actual Phase 2 set -- above the Runyankole figure, so harder
+# languages must be in there too. Training on LANGS caps the leaderboard at 0.359
+# however good the model gets, because only ~16% of the test set is reachable.
+ALL_LANGS = ("ach", "aka", "amh", "dag", "dga", "ewe", "ful", "kpo", "lin",
+             "lug", "mas", "mlg", "nyn", "orm", "sid", "sna", "sog", "tir",
+             "wal")
+
+# amh and tir are written in Ethiopic, the rest in Latin. Adding them grows the
+# CTC alphabet by a few hundred symbols, which is why warm-starting needs
+# --extend-vocab rather than the checkpoint's vocabulary as-is.
+ETHIOPIC_LANGS = ("amh", "tir")
+
 HF_REPO = "google/WaxalNLP"
 SR = 16_000
+
+# 128 kbps mono mp3 is 16 kB per second of audio. Validated against the known
+# size of the LANGS labeled set: 22 shards -> ~197 h.
+BYTES_PER_SECOND = 16_000
+HOURS_PER_SHARD = 8.0        # a shard averages ~460 MB, ~1,500 clips, ~8 h
+
+
+_REPO_FILES: list[str] | None = None
+
+
+def _repo_files() -> list[str]:
+    """The repo file listing, fetched once.
+
+    Shard counts vary enormously by language -- ach has 3 train files, wal has
+    22 -- so a uniform `range(shards)` asks for parquets that do not exist and
+    the load fails. Listing once lets the caps clamp to what is actually there.
+    """
+    global _REPO_FILES
+    if _REPO_FILES is None:
+        from huggingface_hub import list_repo_files
+        _REPO_FILES = list(list_repo_files(HF_REPO, repo_type="dataset"))
+    return _REPO_FILES
+
+
+def available_shards(lang: str, split: str) -> list[str]:
+    """Every parquet that exists for this language and split, in order."""
+    prefix = f"data/ASR/{lang}/{lang}-{split}-"
+    return sorted(f for f in _repo_files()
+                  if f.startswith(prefix) and f.endswith(".parquet"))
 
 
 # datasets >= 4.0 hands back a torchcodec AudioDecoder instead of the old
@@ -65,12 +110,20 @@ def _files(lang: str, split: str) -> str:
 
 
 def load_labeled(langs=LANGS, splits=("train", "validation"), num_proc: int = 1,
-                 shards: int = 0):
-    """Load the labeled portion of the target languages. Never touches `test`.
+                 shards: int | dict[str, int] = 0):
+    """Load the labeled portion of the given languages. Never touches `test`.
 
-    `shards` caps how many parquet files are fetched per language/split. The
-    whole labeled set is ~12.6 GB, so a smoke test that downloads all of it is
-    not a smoke test -- with shards=1 it pulls ~0.5 GB per language instead.
+    `shards` caps how many parquet files are fetched per language/split, and is
+    the knob that makes a 19-language run affordable: the full labeled corpus is
+    ~113 GB / ~1,957 h, but a shard is ~8 h, so `shards=5` gives ~40 h per
+    language for ~44 GB. Pass a dict for per-language caps -- keeping lin/lug/sna
+    at their full size while capping the rest matters, because those three are
+    the only ones currently scoring well and cutting their data would trade a
+    known gain for an unknown one. A `"default"` key covers unlisted languages,
+    and 0 means "everything available".
+
+    Caps clamp to what exists: shard counts run from 3 (ach) to 22 (wal), so a
+    uniform range() would request missing files.
 
     `num_proc` defaults to 1 (no multiprocessing) on purpose. Loading is network-
     and I/O-bound, so extra workers buy little, and a high count relative to the
@@ -83,11 +136,25 @@ def load_labeled(langs=LANGS, splits=("train", "validation"), num_proc: int = 1,
             "the HF `test` split is the Phase 1 test set with public labels -- "
             "loading it risks contaminating training and breaches the rules"
         )
-    parts = []
+
+    def cap_for(lang: str) -> int:
+        if isinstance(shards, dict):
+            return int(shards.get(lang, shards.get("default", 0)))
+        return int(shards)
+
+    parts, hours = [], {}
     for lang in langs:
         for split in splits:
-            files = ([f"data/ASR/{lang}/{lang}-{split}-{i:05d}.parquet"
-                      for i in range(shards)] if shards else _files(lang, split))
+            cap = cap_for(lang)
+            # Resolve to an explicit file list even when uncapped, rather than
+            # handing datasets a glob: it costs one cached repo listing and makes
+            # the hours reported below correct for every language, capped or not.
+            files = available_shards(lang, split)
+            if cap:
+                files = files[:cap]
+            if not files:
+                print(f"  {lang}/{split}: no parquet files -- skipped")
+                continue
             # Never ask for more workers than there are files, and pass None
             # rather than 1 so datasets skips the multiprocessing path entirely.
             n = min(num_proc, len(files)) if isinstance(files, list) else num_proc
@@ -95,7 +162,14 @@ def load_labeled(langs=LANGS, splits=("train", "validation"), num_proc: int = 1,
                 HF_REPO, data_files={split: files}, split=split,
                 num_proc=n if n and n > 1 else None,
             )
+            if isinstance(files, list):
+                hours[lang] = hours.get(lang, 0.0) + len(files) * HOURS_PER_SHARD
             parts.append(ds)
+
+    if hours:
+        total = sum(hours.values())
+        print(f"labeled audio: ~{total:.0f} h across {len(hours)} languages "
+              f"({', '.join(f'{l} ~{h:.0f}h' for l, h in sorted(hours.items()))})")
     ds = datasets.concatenate_datasets(parts)
     return ds.cast_column("audio", datasets.Audio(sampling_rate=SR))
 

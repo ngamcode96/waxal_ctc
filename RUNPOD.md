@@ -347,3 +347,140 @@ runpodctl send /workspace/submission.csv
 - **`--num-proc 16` can exhaust RAM** during extraction (117 GB, 16 workers each
   holding decoded audio). Drop to 8 if you see OOM kills — that is system RAM,
   not VRAM.
+
+---
+
+## 12. Phase 2 run: 6 languages, from cached features
+
+The run that matters. Different from everything above in one respect: **the
+feature cache already exists on the Hub**, so the pod never downloads audio and
+never extracts. It pulls ~13 GB and starts training immediately.
+
+Why six languages: Phase 2 was measured (`scripts/lid.py`, MMS-LID) to be
+East African — `lug` 43.9%, `ach` 30.4%, `nyn` 16.7%, with `sog` folded into the
+`lug` bucket because MMS cannot label Lusoga. `lin` and `sna` are ~4.6% but are
+kept at full size: the challenge is posed as a three-language task and the
+classifier only validated at 70.4%, which is enough to say where to *add* data
+but not to justify discarding any.
+
+### Pod configuration
+
+| setting | value | note |
+|---|---|---|
+| GPU | A100 80 GB | bf16 native; ~2.7 h/epoch at 60k rows |
+| Container disk | 40 GB | |
+| Volume disk | **60 GB** | smaller than §1 — no audio, no extraction |
+
+Disk: ~13 GB features + ~9 GB checkpoints. No `hf/hub`, no `hf/datasets`.
+
+### Sequence
+
+```bash
+export HF_HOME=/workspace/hf
+export HF_TOKEN=hf_...                      # WRITE permission
+apt-get update -qq && apt-get install -y -qq tmux && tmux new -s train
+
+git clone https://github.com/ngamcode96/waxal_ctc.git /workspace/waxal
+cd /workspace/waxal
+pip install -e ".[train]"
+
+python -c "import sys; sys.path.insert(0,'src'); from waxal import hw; print(hw.describe())"
+python scripts/check_hub.py --repo ngia/ctc-p2        # fails now, not at epoch 1
+
+python scripts/sync_features.py pull \
+    --cache-dir /workspace/cache --repo ngia/waxal-features-p2
+
+python scripts/train_ctc.py \
+    --langs ach lin lug nyn sna sog \
+    --shards 0 \
+    --init-from ngia/ctc-v2-avg \
+    --extend-vocab \
+    --output-dir /workspace/ctc-p2 \
+    --cache-dir /workspace/cache \
+    --push-to-hub ngia/ctc-p2 --hub-strategy every_save \
+    --balance --balance-alpha 0 \
+    --mask-time-prob 0.05 --mask-feature-prob 0.008 --mask-feature-length 64 \
+    --epochs 3 --batch-size 16 --grad-accum 2 --lr 2e-5 \
+    --num-proc 16 --valid-frac 0.06 --seed 42
+```
+
+`--batch-size 16 --grad-accum 2` holds the effective batch at 32 on an 80 GB
+card. Drop to `8 / 4` on 40 GB or on any OOM.
+
+Everything from `--langs` through `--extend-vocab` must match the extraction run
+**exactly** or the cache key misses. `--balance`, masking, `--epochs`, `--lr` and
+batch sizes are all outside the key and free to change.
+
+### The four lines that say it is working
+
+```
+cache vocabulary extends ngia/ctc-v2-avg by 1 symbol(s), ids unchanged -- compatible
+reusing cached features from /workspace/cache (source not needed)
+checkpoint head is 86; tokenizer wants 87
+CTC head 86 -> 87 outputs (1 new symbols, trained rows preserved)
+```
+
+If instead it prints `cached '...' was built with different settings` and starts
+downloading, **kill it** — an argument drifted, and it is about to spend an hour
+of credits redoing work. It prints both keys; the differing field names the cause.
+
+### What to watch
+
+Pre-training baseline, measured 2026-07-28 on this exact validation split:
+
+| lang | baseline | share of Phase 2 |
+|---|---|---|
+| `ach` | **0.898** | 30.4% |
+| `nyn` | 0.568 | 16.7% |
+| `sog` | 0.444 | inside the `lug` bucket |
+| `lin` | 0.237 | 0.5% |
+| `sna` | 0.118 | 4.1% |
+| `lug` | 0.094 | 43.9% |
+
+`eval_combined_ach` is the number that matters. It starts at 0.898 and any epoch
+that does not move it is a wasted epoch. If it is still falling steeply after
+epoch 3, add epochs — every one is already on the Hub via `every_save`.
+
+Validation reads ~0.1–0.17 *better* than Phase 2, because it cannot contain the
+~56% of Phase 2 clips that MMS placed outside the corpus's 19 languages.
+
+### After training
+
+Average the last three checkpoints — worth 0.1591 -> 0.1572 locally and
+0.7912 -> 0.7951 on the leaderboard last time, for ten minutes of compute.
+
+```bash
+ls -d /workspace/ctc-p2/checkpoint-*        # pick the last three
+
+python scripts/average_checkpoints.py \
+    --checkpoints /workspace/ctc-p2/checkpoint-A \
+                  /workspace/ctc-p2/checkpoint-B \
+                  /workspace/ctc-p2/checkpoint-C \
+    --output-dir /workspace/ctc-p2-avg
+```
+
+Measure the gain against the baselines above, on the languages that matter:
+
+```bash
+python scripts/selftest_phase2.py --model /workspace/ctc-p2-avg \
+    --langs nyn sog ach --n 150 --work /workspace/selftest --shards 1
+```
+
+That downloads ~1.5 GB of labeled audio and scores against `nyn` 0.568,
+`sog` 0.444, `ach` 0.898.
+
+Then push the averaged model and **run inference on Kaggle, not here**:
+
+```bash
+python scripts/push_checkpoint.py \
+    --output-dir /workspace/ctc-p2-avg --repo ngia/ctc-p2-avg
+```
+
+`data/phase_2` does not exist on the pod, and section 6 of the notebook already
+downloads the Phase 2 audio, runs `infer_phase2.py`, and validates the
+submission. Set `P2_MODEL = "ngia/ctc-p2-avg"` there. Inference is ~30 minutes
+on two T4s and needs no GPU credits.
+
+**Never ship a blank `Target`** — Zindi reports it as `Missing entries for IDs`
+and rejects the file. `infer_phase2.py` fills them via `--fallback-text`
+(default `"ya"`) automatically.

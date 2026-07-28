@@ -32,6 +32,18 @@ CHAR_MAP = {
 }
 
 # The alphabet we actually train on. Anything outside this is dropped.
+#
+# KEEP covers lin/lug/sna only. The corpus has 19 languages and Phase 2 draws
+# from more than three, so training beyond LANGS needs KEEP_19 -- measured
+# 2026-07-28 over one train shard per language, this KEEP silently destroys:
+#
+#     amh  20.5% of characters survive    tir  21.6%    <- Ethiopic, wiped out
+#     kpo  80.9%    ewe  90.3%    aka  92.1%    dga  93.2%    dag  94.1%
+#     ful  94.8%
+#
+# so eight languages lose text, not just the two in a different script. Deleting
+# 'ɔ' and 'ɛ' from Akan or Ewe does not make those languages merely harder, it
+# makes the target transcripts wrong.
 KEEP = set(
     "abcdefghijklmnopqrstuvwxyz"
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -40,13 +52,59 @@ KEEP = set(
     " '-.,!?;:()\""
 )
 
+# The 19-language alphabet: every letter appearing at least 50 times across one
+# train shard per language, unioned with KEEP so nothing lin/lug/sna already
+# train on can be dropped. 319 characters, covering 99.96% of all letter tokens
+# in the corpus -- the tail below that threshold is encoding noise and one-off
+# borrowings that would get too little training signal to learn.
+KEEP_19 = KEEP | set(
+    # Latin beyond ASCII: African orthographies (Ewe, Dagbani, Fula, Akan,
+    # Kabiye) plus the Lingala/Shona diacritics.
+    "àáâãçèéêëìíîïòóôõùúûüēĩŋũūƁƆƉƊƐƒƙƴǝɑɓɔɖɗɛɡɣɩɲʊʋʒͻιԑẽỳ"
+    # Ethiopic syllabary: Amharic and Tigrinya.
+    "ሀሁሂሃሄህሆለሉሊላሌልሎሏሐሑሒሓሕመሙሚማሜምሞሟሠሣሥረ"
+    "ሩሪራሬርሮሯሰሱሲሳሴስሶሸሹሻሽቀቁቂቃቅቆቋቐቑቓቕበቡቢ"
+    "ባቤብቦቧቪተቱቲታቴትቶቷቸቹቻችኃኅኋነኑኒናኔንኖኘኙኛኝ"
+    "ኞአኡኢኣኤእኦከኩኪካኬክኮኳኸኹኻኽኾወዉዊዋውዎዐዑዒዓዕ"
+    "ዘዙዚዛዜዝዞዣዥየዩዪያይዮደዱዲዳዴድዶጀጁጂጃጅጆገጉጊጋ"
+    "ጌግጎጐጓጕጠጡጢጣጤጥጦጧጨጫጭጴጵጸጹጺጻጽፀፁፂፃፅፈፉፊ"
+    "ፋፌፍፎፏፐፒፓፕፖ"
+)
+
 _ACCENT_UPPER = str.maketrans("ÀÁÂÇÈÉÊËÌÍÎÏÒÓÔÙÚÛÜ", "àáâçèéêëìíîïòóôùúûü")
 
+# Which alphabet clean() is currently using. A run-level setting rather than a
+# per-call argument because clean() is called from training, evaluation and
+# scoring alike, and every one of them has to agree -- a reference cleaned with
+# one alphabet and a hypothesis with another would score nonsense.
+_ACTIVE = KEEP
 
-def clean(text: str) -> str:
+
+def set_alphabet(langs) -> set:
+    """Pick the alphabet for this run from the languages being trained on.
+
+    Called once at startup. Anything beyond lin/lug/sna needs KEEP_19, or the
+    transcripts for eight of the nineteen languages arrive partly or wholly
+    deleted -- see the note on KEEP.
+    """
+    global _ACTIVE
+    extra = set(langs) - {"lin", "lug", "sna"}
+    _ACTIVE = KEEP_19 if extra else KEEP
+    print(f"alphabet: {'KEEP_19' if extra else 'KEEP'} "
+          f"({len(_ACTIVE)} characters)"
+          + (f" -- required by {sorted(extra)}" if extra else ""))
+    return _ACTIVE
+
+
+def active_alphabet() -> set:
+    return _ACTIVE
+
+
+def clean(text: str, keep: set | None = None) -> str:
     """Normalize a transcript to the training alphabet, preserving case/punctuation."""
     if not isinstance(text, str):
         return ""
+    keep = _ACTIVE if keep is None else keep
 
     text = unicodedata.normalize("NFC", text)
     for src, dst in CHAR_MAP.items():
@@ -60,7 +118,7 @@ def clean(text: str) -> str:
     # target. Drop them rather than teach the model an unpronounceable symbol.
     text = re.sub(r"\d+", " ", text)
 
-    text = "".join(c for c in text if c in KEEP)
+    text = "".join(c for c in text if c in keep)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
