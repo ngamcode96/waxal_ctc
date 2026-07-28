@@ -699,6 +699,14 @@ def main() -> None:
                          "~40h each (a shard is ~8h), or --shards 5 lin=0 lug=0 "
                          "sna=0 to cap the new languages while keeping the "
                          "already-good three at full size. 0 means everything")
+    ap.add_argument("--attn-implementation", default=None,
+                    choices=("sdpa", "flash_attention_2", "eager"),
+                    help="attention kernel. 'eager' materializes the full "
+                         "batch x heads x seq x seq score matrix -- at 30s clips "
+                         "that is ~1,500 frames and hundreds of MB per layer, "
+                         "which is what makes this model OOM on an 80GB card. "
+                         "'sdpa' avoids materializing it and is usually faster "
+                         "too. Left unset, transformers picks its own default")
     ap.add_argument("--balance", action="store_true",
                     help="resample languages each epoch so a small language is "
                          "not drowned out by a large one. Epoch length is "
@@ -1073,7 +1081,12 @@ def build_and_train(args, processor, tokenizer, train_ds, valid_ds,
         add_adapter=True,
         pad_token_id=processor.tokenizer.pad_token_id,
         vocab_size=load_size,
+        **({"attn_implementation": args.attn_implementation}
+           if args.attn_implementation else {}),
     )
+    if args.attn_implementation:
+        actual = getattr(model.config, "_attn_implementation", "?")
+        print(f"attention: requested {args.attn_implementation}, using {actual}")
     if load_size != target_size:
         extend_ctc_head(model, target_size)
 

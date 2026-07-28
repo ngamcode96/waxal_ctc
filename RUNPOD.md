@@ -404,8 +404,16 @@ python scripts/train_ctc.py \
     --num-proc 16 --valid-frac 0.06 --seed 42
 ```
 
-`--batch-size 16 --grad-accum 2` holds the effective batch at 32 on an 80 GB
-card. Drop to `8 / 4` on 40 GB or on any OOM.
+**`--batch-size 8 --grad-accum 4`, not 16/2.** Measured 2026-07-29: batch 16
+OOMs on an 80 GB A100 at 77.67 GiB allocated. The clips run to 30 s, which is
+~1,500 encoder frames, attention is quadratic in that, and `wants_gradient_checkpointing`
+turns checkpointing *off* above 40 GB VRAM -- so every layer's activations are
+kept. The §5 table's "16 on an 80 GB A100" predates this dataset; do not reuse it.
+
+Effective batch is 32 either way. If 8 still OOMs, add
+`--gradient-checkpointing true`: ~35% slower (2.7 -> 3.6 h/epoch) but a large drop
+in activation memory. The length-grouped sampler puts the longest clips in the
+first batch on purpose, so an OOM appears within a minute rather than hours in.
 
 Everything from `--langs` through `--extend-vocab` must match the extraction run
 **exactly** or the cache key misses. `--balance`, masking, `--epochs`, `--lr` and
