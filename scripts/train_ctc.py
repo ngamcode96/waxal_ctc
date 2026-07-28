@@ -257,10 +257,48 @@ def load_from_cache_only(args, key_base: dict):
     processor = transformers.Wav2Vec2BertProcessor(feature_extractor=fe,
                                                    tokenizer=tokenizer)
 
+    def load_shard(f):
+        """One cached Arrow shard, tolerating a newer writer's schema metadata.
+
+        datasets stamps its own feature description into the Arrow schema, and
+        the vocabulary of type names grows between releases -- "List" arrived in
+        4.0. Extracting on a box with datasets>=4 and training on one with 3.x
+        therefore dies in Features.from_arrow_schema with "Feature type 'List'
+        not found", even though the data underneath is plain arrays.
+
+        Since the pod deliberately pins datasets<4 (4.x decodes audio through
+        torchcodec, whose compiled extension breaks on the image's CUDA), the
+        fix cannot be "upgrade everywhere". Drop the metadata and let the types
+        be inferred from the Arrow schema itself, which is version-independent.
+        """
+        try:
+            return datasets.Dataset.from_file(str(f))
+        except Exception as e:
+            # Deliberately broad: the mismatch surfaces differently depending on
+            # which direction the versions skew -- ValueError("Feature type
+            # 'List' not found") reading a 4.x file with 3.x, KeyError('feature')
+            # for a type that exists but changed shape. Stripping metadata is
+            # safe whatever the cause; if it does not help, the original error is
+            # re-raised untouched.
+            import pyarrow as pa
+            try:
+                try:
+                    with pa.memory_map(str(f)) as src:
+                        table = pa.ipc.open_stream(src).read_all()
+                except pa.ArrowInvalid:
+                    with pa.memory_map(str(f)) as src:
+                        table = pa.ipc.open_file(src).read_all()
+                ds = datasets.Dataset(table.replace_schema_metadata(None))
+            except Exception:
+                raise e
+            print(f"  {Path(f).name}: schema metadata unreadable by this "
+                  f"datasets ({type(e).__name__}: {str(e)[:60]}) -- "
+                  f"read without it, types inferred from Arrow")
+            return ds
+
     def load(tag):
         return datasets.concatenate_datasets(
-            [datasets.Dataset.from_file(str(f))
-             for f in shard_files(args.cache_dir, tag)])
+            [load_shard(f) for f in shard_files(args.cache_dir, tag)])
 
     train_ds, valid_ds = load("train"), load("valid")
     print(f"  train={len(train_ds):,}  valid={len(valid_ds):,}")
