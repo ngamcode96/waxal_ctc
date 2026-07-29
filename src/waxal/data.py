@@ -59,6 +59,48 @@ def _repo_files() -> list[str]:
     return _REPO_FILES
 
 
+def read_arrow_shard(path):
+    """One cached Arrow shard, tolerating a writer from a different datasets.
+
+    datasets stamps its own feature description into the Arrow schema, and the
+    vocabulary of type names changes between releases -- "List" arrived in 4.0.
+    Extracting features on a box with datasets>=4 and reading them on one with
+    3.x therefore dies in Features.from_arrow_schema, even though the data
+    underneath is plain arrays. That split is normal here: extraction runs on
+    Kaggle and training on a pod that pins datasets<4, because 4.x decodes audio
+    through torchcodec, whose compiled extension breaks on the pod's CUDA.
+
+    Deliberately broad `except`: the mismatch surfaces as ValueError one way and
+    KeyError the other. Dropping the metadata is safe whatever the cause -- the
+    types are inferred from the Arrow schema itself -- and if it does not help,
+    the original error is re-raised untouched.
+
+    Every reader of the feature cache must go through here. Patching one call
+    site and not the others is how eval_checkpoint.py stayed broken after
+    train_ctc.py was fixed.
+    """
+    from pathlib import Path as _Path
+
+    try:
+        return datasets.Dataset.from_file(str(path))
+    except Exception as e:
+        import pyarrow as pa
+        try:
+            try:
+                with pa.memory_map(str(path)) as src:
+                    table = pa.ipc.open_stream(src).read_all()
+            except pa.ArrowInvalid:
+                with pa.memory_map(str(path)) as src:
+                    table = pa.ipc.open_file(src).read_all()
+            ds = datasets.Dataset(table.replace_schema_metadata(None))
+        except Exception:
+            raise e
+        print(f"  {_Path(path).name}: schema metadata unreadable by this "
+              f"datasets ({type(e).__name__}: {str(e)[:60]}) -- read without "
+              f"it, types inferred from Arrow")
+        return ds
+
+
 def available_shards(lang: str, split: str) -> list[str]:
     """Every parquet that exists for this language and split, in order."""
     prefix = f"data/ASR/{lang}/{lang}-{split}-"

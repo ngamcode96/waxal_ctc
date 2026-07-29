@@ -32,6 +32,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import datasets
 
+from waxal import data as wdata  # noqa: E402
+
 
 def resolve_vocab(cache_dir: Path, vocab_path: Path | None) -> Path:
     """Find a vocab.json, falling back to the one inside the cache manifest.
@@ -73,7 +75,7 @@ def corpus_from_cache(cache_dir: Path, vocab_path: Path) -> list[str]:
         raise SystemExit(f"no train shards in {cache_dir}")
 
     ds = datasets.concatenate_datasets(
-        [datasets.Dataset.from_file(str(f)) for f in shards])
+        [wdata.read_arrow_shard(f) for f in shards])
     print(f"decoding {len(ds):,} training transcripts")
     return [tok.decode(ids, group_tokens=False) for ids in ds["labels"]]
 

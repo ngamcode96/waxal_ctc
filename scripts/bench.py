@@ -23,6 +23,7 @@ import datasets
 import torch
 import transformers
 
+from waxal import data as wdata
 from waxal import hw
 
 MODEL_ID = "facebook/w2v-bert-2.0"
@@ -70,7 +71,7 @@ def bench_data(cache_dir: Path, batch_size: int, workers: int, steps: int) -> tu
     if not shards:
         raise FileNotFoundError(f"no feature shards in {cache_dir}")
     ds = datasets.concatenate_datasets(
-        [datasets.Dataset.from_file(str(f)) for f in shards])
+        [wdata.read_arrow_shard(f) for f in shards])
     lengths = ds["length"]
 
     def collate(feats):

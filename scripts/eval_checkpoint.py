@@ -24,6 +24,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from infer import load_processor  # noqa: E402
 
+from waxal import data as wdata  # noqa: E402
 from waxal.metric import score, score_by_language  # noqa: E402
 
 
@@ -33,7 +34,7 @@ def load_valid(cache_dir: Path):
     if not shards:
         raise SystemExit(f"no valid shards in {cache_dir}")
     return datasets.concatenate_datasets(
-        [datasets.Dataset.from_file(str(f)) for f in shards])
+        [wdata.read_arrow_shard(f) for f in shards])
 
 
 def _ctc_labels(processor) -> list[str]:
