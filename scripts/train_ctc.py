@@ -633,6 +633,10 @@ def main() -> None:
     ap.add_argument("--pseudo-shards", type=int, nargs="+", default=[0],
                     help="unlabeled shards the pseudo-labels came from -- must "
                          "cover the labelling run or ids will not be found")
+    ap.add_argument("--pseudo-langs", nargs="+", default=None,
+                    help="which unlabeled pools to search for the pseudo ids. "
+                         "Defaults to --langs, which is what you want unless the "
+                         "labelling run covered a different set")
     ap.add_argument("--pseudo-min-conf", type=float, default=0.0,
                     help="drop pseudo-labels below this confidence")
     ap.add_argument("--pseudo-max", type=int, default=0,
@@ -883,7 +887,12 @@ def attach_pseudo(train_ds, args):
         return train_ds
 
     ids = set(df.id)
-    uds = wdata.load_unlabeled(shards=tuple(args.pseudo_shards),
+    # Follow --langs, not waxal.data.LANGS. Defaulting to the module constant
+    # meant a run training on ach/nyn/sog searched the lin/lug/sna pool and
+    # matched nothing, silently training on labeled data alone.
+    pseudo_langs = tuple(args.pseudo_langs or args.langs)
+    print(f"  searching the unlabeled pool for {list(pseudo_langs)}")
+    uds = wdata.load_unlabeled(pseudo_langs, shards=tuple(args.pseudo_shards),
                                num_proc=args.load_proc)
     uds = uds.filter(lambda i: i in ids, input_columns="id",
                      desc="selecting pseudo clips")
