@@ -411,7 +411,7 @@ turns checkpointing *off* above 40 GB VRAM -- so every layer's activations are
 kept. The §5 table's "16 on an 80 GB A100" predates this dataset; do not reuse it.
 
 Effective batch is 32 either way. If 8 still OOMs, add
-`--gradient-checkpointing true`: ~35% slower (2.7 -> 3.6 h/epoch) but a large drop
+`--gradient-checkpointing`: ~35% slower (2.7 -> 3.6 h/epoch) but a large drop
 in activation memory. The length-grouped sampler puts the longest clips in the
 first batch on purpose, so an OOM appears within a minute rather than hours in.
 
