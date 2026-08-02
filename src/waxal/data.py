@@ -59,6 +59,44 @@ def _repo_files() -> list[str]:
     return _REPO_FILES
 
 
+def resample(arr: np.ndarray, sr_in: int, sr_out: int = SR) -> np.ndarray:
+    """Resample a waveform, with anti-aliasing.
+
+    The corrected Phase 2 audio is 48 kHz; the model is trained at 16 kHz.
+    Downsampling needs a low-pass filter first or everything between 8 and
+    24 kHz folds back into the speech band -- the result still sounds like
+    speech and still transcribes, which is exactly why it is dangerous.
+
+    Deliberately NOT train_ctc._resample: that is bare linear interpolation,
+    correct for speed perturbation (where the whole point is to shift pitch
+    without filtering) and wrong here.
+
+    Fails loudly rather than falling back to interpolation. A silent aliasing
+    bug would cost a submission and look like a modelling problem.
+    """
+    if sr_in == sr_out:
+        return arr.astype(np.float32)
+    try:
+        from math import gcd
+
+        from scipy.signal import resample_poly
+        g = gcd(int(sr_in), int(sr_out))
+        return resample_poly(arr, sr_out // g, sr_in // g).astype(np.float32)
+    except ImportError:
+        pass
+    try:
+        import librosa
+        return librosa.resample(arr.astype(np.float32),
+                                orig_sr=sr_in, target_sr=sr_out).astype(np.float32)
+    except ImportError:
+        pass
+    raise SystemExit(
+        f"cannot resample {sr_in} Hz -> {sr_out} Hz: neither scipy nor librosa "
+        f"is installed.\n    pip install scipy\n"
+        f"Refusing to interpolate instead -- without an anti-aliasing filter "
+        f"that produces audio that transcribes plausibly and scores badly.")
+
+
 def read_arrow_shard(path):
     """One cached Arrow shard, tolerating a writer from a different datasets.
 

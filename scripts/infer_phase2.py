@@ -8,11 +8,12 @@ both the id set and the row order -- and each wav is read directly from
 `<audio-dir>/<ID>.wav`. That also drops the datasets/torchcodec dependency from
 the submission path entirely.
 
-Two other differences from Phase 1, both measured on the real data (2026-07-27):
+Two other differences from Phase 1, measured on the corrected data (2026-08-02):
 
-* Clips run 18-30 s (mean 22.3 s) against Phase 1's much shorter and wider
-  spread, so batches are formed over length-sorted clips. Padding a 30 s clip
-  out with an 18 s one wastes 40% of the batch.
+* Clips run 1.0-35.2 s (mean 20.2 s), so batches are formed over length-sorted
+  clips. Padding a 35 s clip out with a 1 s one wastes most of the batch. Note
+  the tail beyond 30 s is longer than anything training saw, since --max-s
+  capped extraction at 30.
 * A clip that fails to transcribe cannot simply be dropped: every id in the CSV
   needs a row. An OOM bisects the batch and retries rather than skipping.
 
@@ -46,6 +47,7 @@ import torch                                                # noqa: E402
 
 from infer import build_lm_decoder, load_processor          # noqa: E402
 from pseudo_label import is_degenerate                      # noqa: E402
+from waxal import data as wdata                             # noqa: E402
 from waxal import hw                                        # noqa: E402
 from waxal.data import SR                                   # noqa: E402
 
@@ -54,8 +56,11 @@ def read_wav(path: Path) -> tuple[np.ndarray, int]:
     """Mono float32 waveform and its sample rate.
 
     soundfile if it is installed, else the stdlib `wave` module -- the Phase 2
-    clips are 16 kHz mono int16 PCM, which `wave` reads natively. Keeping the
-    fallback means the submission path has no hard audio dependency.
+    clips are mono 16-bit PCM, which `wave` reads natively. Keeping the fallback
+    means the submission path has no hard audio dependency.
+
+    Returns the file's own rate; the caller resamples. The corrected Phase 2
+    audio is 48 kHz where the model is trained at 16.
     """
     try:
         import soundfile as sf
@@ -81,8 +86,9 @@ def read_wav(path: Path) -> tuple[np.ndarray, int]:
 def wav_seconds(path: Path) -> float:
     """Duration from the header alone, for length sorting.
 
-    Reading 1,500 headers costs milliseconds; decoding 1,500 clips to measure
-    them costs minutes, and the decode would then be thrown away.
+    Reading 892 headers costs milliseconds; decoding them to measure costs
+    minutes, and the decode would then be thrown away. Rate-independent: it
+    divides frames by the file's own rate.
     """
     import wave
     try:
@@ -107,11 +113,11 @@ class ClipDataset(torch.utils.data.Dataset):
         uid, path = self.items[i]
         arr, sr = read_wav(path)
         if sr != SR:
-            raise SystemExit(
-                f"{path} is {sr} Hz but the model expects {SR} Hz. Resample the "
-                f"Phase 2 audio before transcribing -- silently feeding the "
-                f"wrong rate produces plausible-looking garbage.")
-        feats = self.processor(arr, sampling_rate=sr).input_features[0]
+            # The corrected Phase 2 audio is 48 kHz. waxal.data.resample uses a
+            # polyphase filter; feeding the wrong rate straight to the feature
+            # extractor produces plausible-looking garbage rather than an error.
+            arr = wdata.resample(arr, sr, SR)
+        feats = self.processor(arr, sampling_rate=SR).input_features[0]
         return {"uid": uid, "feats": np.asarray(feats, dtype=np.float32)}
 
 

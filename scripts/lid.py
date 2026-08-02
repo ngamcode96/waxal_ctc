@@ -194,7 +194,8 @@ def read_clips(paths):
     for p in paths:
         a, sr = read_wav(p)
         if sr != wdata.SR:
-            raise SystemExit(f"{p} is {sr} Hz, expected {wdata.SR}")
+            # The corrected Phase 2 audio is 48 kHz; MMS-LID expects 16.
+            a = wdata.resample(a, sr, wdata.SR)
         arrs.append(a)
     return arrs
 
