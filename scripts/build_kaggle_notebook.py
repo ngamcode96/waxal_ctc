@@ -430,29 +430,24 @@ the id set and the row order.
 """))
     cells.append(code("""
 import glob, os, pathlib, subprocess
+import pandas as pd
 
 AUDIO_URL = "https://storage.googleapis.com/waxalphase2/newaudios.zip"
 WORK = pathlib.Path("/kaggle/temp/phase2")
 WORK.mkdir(parents=True, exist_ok=True)
 
-# Find the attached Phase 2 dataset, whatever it was named.
-csvs = glob.glob("/kaggle/input/**/Test_phase2.csv", recursive=True)
-assert csvs, "attach a dataset containing Test_phase2.csv (Add data -> your upload)"
-PHASE2_CSV = csvs[0]
-src = pathlib.Path(PHASE2_CSV).parent
-print(f"csv:  {PHASE2_CSV}")
-
-# Audio, in order of preference: already extracted in the dataset, a zip in the
-# dataset, or the organizers' URL. /kaggle/input is read-only, so any extract
-# has to land on /kaggle/temp.
-# The corrected archive extracts to newaudios/, not audio/.
-dirs = [d for d in glob.glob(str(src / "**" / "newaudios"), recursive=True)
+# --- audio first, because it is what decides which CSV is the right one ---
+# Order of preference: already extracted in an attached dataset, a zip in one,
+# or the organizers' URL. /kaggle/input is read-only, so extraction lands on
+# /kaggle/temp. The corrected archive unpacks to newaudios/, not audio/.
+dirs = [d for d in glob.glob("/kaggle/input/**/newaudios", recursive=True)
         if os.path.isdir(d)]
-zips = glob.glob(str(src / "**" / "*.zip"), recursive=True)
+zips = [z for z in glob.glob("/kaggle/input/**/*.zip", recursive=True)
+        if "newaudio" in os.path.basename(z).lower()]
 
 if dirs:
     PHASE2_AUDIO = dirs[0]
-    print(f"using the extracted audio already in the dataset")
+    print(f"using audio already extracted in the dataset: {PHASE2_AUDIO}")
 else:
     PHASE2_AUDIO = str(WORK / "newaudios")
     if zips:
@@ -466,24 +461,62 @@ else:
         subprocess.run(["curl", "-L", "--fail", "--retry", "3", "-C", "-",
                         "-o", archive, AUDIO_URL], check=True)
         # Checked against the URL on 2026-08-02. A truncated download would
-        # otherwise surface as a confusing unzip error several minutes later.
+        # otherwise surface as a confusing extraction error minutes later.
         got = os.path.getsize(archive)
         assert got == 1_086_719_156, f"expected 1,086,719,156 bytes, got {got:,}"
         print(f"downloaded {got / 1e6:.0f} MB")
 
-    # -x '__MACOSX/*' matters: the archive carries a ._<ID>.wav resource fork
-    # beside every clip, and they are not audio.
-    subprocess.run(["unzip", "-q", "-o", archive, "-x", "__MACOSX/*",
-                    "-d", str(WORK)], check=True)
+    # zipfile rather than unzip: the pod images do not all ship unzip. Filtering
+    # on .wav also drops the __MACOSX/._<ID>.wav resource forks, which are not
+    # audio and would otherwise be ingested as junk.
+    import zipfile
+    with zipfile.ZipFile(archive) as z:
+        members = [n for n in z.namelist()
+                   if n.endswith(".wav") and not n.startswith("__MACOSX/")]
+        z.extractall(str(WORK), members=members)
+    print(f"extracted {len(members):,} wavs")
 
-import pandas as pd
-N_EXPECTED = len(pd.read_csv(PHASE2_CSV, escapechar="\\\\"))
-n_wav = len(glob.glob(os.path.join(PHASE2_AUDIO, "*.wav")))
-print(f"audio: {PHASE2_AUDIO}  ({n_wav:,} wavs)   csv rows: {N_EXPECTED:,}")
-assert n_wav == N_EXPECTED, (
-    f"{n_wav:,} wavs but {N_EXPECTED:,} csv rows -- if the csv has 1,500 rows "
-    f"it is the OLD one, whose ids match nothing in the corrected audio")
-assert n_wav == 892, f"expected 892 corrected Phase 2 clips, found {n_wav:,}"
+wavs = {os.path.basename(p)[:-4] for p in glob.glob(os.path.join(PHASE2_AUDIO, "*.wav"))}
+print(f"audio: {PHASE2_AUDIO}  ({len(wavs):,} wavs)")
+assert len(wavs) == 892, f"expected 892 corrected Phase 2 clips, found {len(wavs):,}"
+
+# --- now pick the CSV whose ids actually match that audio ---
+# Matching on filename is fragile: the corrected file has been posted as
+# Test_phase2.csv, Test_Phase2_v2.csv and other spellings, and the OLD file is
+# often still attached alongside it. The id set is unambiguous.
+PHASE2_CSV, rejected = None, []
+for f in sorted(glob.glob("/kaggle/input/**/*.csv", recursive=True)):
+    try:
+        df = pd.read_csv(f, escapechar="\\\\")
+    except Exception:
+        continue
+    if "ID" not in df.columns:
+        continue
+    ids = set(df.ID.astype(str))
+    if ids == wavs:
+        PHASE2_CSV = f
+        break
+    rejected.append((f, len(ids), len(ids & wavs)))
+
+if PHASE2_CSV is None:
+    print("no attached CSV matches the corrected audio. Candidates seen:")
+    for f, n, overlap in rejected:
+        print(f"  {os.path.basename(f):<34} {n:>6} ids, {overlap:>4} match")
+    raise SystemExit(
+        "attach the CORRECTED Test_phase2.csv. A file with 1,500 ids and 0 "
+        "matches is the old one -- its ids share nothing with the new audio.")
+
+print(f"csv:   {PHASE2_CSV}  (ids match the audio exactly)")
+for f, n, overlap in rejected:
+    print(f"  ignored {os.path.basename(f)}: {n} ids, {overlap} match")
+
+# The organizers ship this pre-filled with placeholder text; inference
+# overwrites it, but never submit the file as handed to you.
+sample = pd.read_csv(PHASE2_CSV, escapechar="\\\\").Target.dropna().astype(str)
+if len(sample) and sample.nunique() <= 2:
+    print()
+    print(f"note: Target arrives pre-filled with {sample.iloc[0]!r} -- placeholder,")
+    print("      overwritten by inference. Do not submit this file unchanged.")
 """))
     cells.append(code("""
 # Which model to score with. The corrected test set reopened this question:
