@@ -73,7 +73,7 @@ Hugging Face).
 
     cells.append(md("## 1. Environment"))
     cells.append(code("""
-!pip install -q -U "transformers>=4.44" datasets jiwer accelerate soundfile librosa
+!pip install -q -U "transformers>=4.44" datasets jiwer accelerate soundfile librosa scipy
 
 import os, pathlib
 # /kaggle/working is capped at ~20 GB and the labeled audio is ~12.6 GB; keep the
@@ -399,28 +399,39 @@ else:
     cells.append(md("""
 ## 6. Phase 2 submission — **this is the one that scores**
 
-The audio downloads straight from the organizers:
+**Zindi replaced the Phase 2 test data on 2 August** — the set released the week
+before was confirmed wrong. This section uses the corrected files. Everything
+about the old set (1,500 clips, 16 kHz, 18–30 s) is obsolete, and no id carries
+over.
 
-    https://storage.googleapis.com/waxalphase2/audio.zip   (762 MB, 1,500 wavs)
+    https://storage.googleapis.com/waxalphase2/newaudios.zip   (1.09 GB, 892 wavs)
 
-`Test_phase2.csv` is not at that URL, so attach it as a Kaggle dataset — the cell
-below finds it under `/kaggle/input` whatever you named the dataset, so nothing
-here hardcodes a slug. If you also put `audio.zip` in that dataset it is used in
-preference to downloading.
+| | old (wrong) | corrected |
+|---|---|---|
+| clips | 1,500 | **892** |
+| sample rate | 16 kHz | **48 kHz** |
+| duration | 18.0–30.0 s | **1.0–35.2 s** |
+| total audio | 9.28 h | **5.00 h** |
 
-`scripts/infer_phase2.py` is used rather than `infer.py --phase 2`. Phase 2 is a
+**The 48 kHz matters more than it looks.** The model is trained at 16 kHz, and
+feeding it 48 kHz does not raise — it produces audio that still sounds like
+speech and still transcribes, just wrongly. `waxal.data.resample` downsamples
+with a polyphase anti-aliasing filter, which needs **scipy** installed.
+
+`Test_phase2.csv` is not at that URL, so attach the corrected one as a Kaggle
+dataset. The cell below finds it under `/kaggle/input` whatever you named the
+dataset. **Make sure it is the new CSV** — the old one's ids match nothing.
+
+`scripts/infer_phase2.py` is used rather than `infer.py --phase 2`: Phase 2 is a
 directory of wavs plus a CSV of ids, and the audiofolder loader behind
 `--phase 2` returns an `audio` column with no `id`, so there is no way to say
 which prediction belongs to which clip. Here the CSV is the authority for both
 the id set and the row order.
-
-Phase 2 needs no internet once the model is cached, but the model still downloads
-from the Hub — leave **Internet ON**.
 """))
     cells.append(code("""
 import glob, os, pathlib, subprocess
 
-AUDIO_URL = "https://storage.googleapis.com/waxalphase2/audio.zip"
+AUDIO_URL = "https://storage.googleapis.com/waxalphase2/newaudios.zip"
 WORK = pathlib.Path("/kaggle/temp/phase2")
 WORK.mkdir(parents=True, exist_ok=True)
 
@@ -434,7 +445,8 @@ print(f"csv:  {PHASE2_CSV}")
 # Audio, in order of preference: already extracted in the dataset, a zip in the
 # dataset, or the organizers' URL. /kaggle/input is read-only, so any extract
 # has to land on /kaggle/temp.
-dirs = [d for d in glob.glob(str(src / "**" / "audio"), recursive=True)
+# The corrected archive extracts to newaudios/, not audio/.
+dirs = [d for d in glob.glob(str(src / "**" / "newaudios"), recursive=True)
         if os.path.isdir(d)]
 zips = glob.glob(str(src / "**" / "*.zip"), recursive=True)
 
@@ -442,21 +454,21 @@ if dirs:
     PHASE2_AUDIO = dirs[0]
     print(f"using the extracted audio already in the dataset")
 else:
-    PHASE2_AUDIO = str(WORK / "audio")
+    PHASE2_AUDIO = str(WORK / "newaudios")
     if zips:
         archive = zips[0]
         print(f"using the zip from the dataset: {archive}")
     else:
-        archive = str(WORK / "audio.zip")
+        archive = str(WORK / "newaudios.zip")
         # -C - resumes a partial file, so a dropped connection costs only the
-        # remainder rather than another 762 MB. --retry covers a flaky start.
+        # remainder rather than another 1.09 GB. --retry covers a flaky start.
         print(f"downloading {AUDIO_URL}")
         subprocess.run(["curl", "-L", "--fail", "--retry", "3", "-C", "-",
                         "-o", archive, AUDIO_URL], check=True)
-        # Checked against the URL on 2026-07-27. A truncated download would
+        # Checked against the URL on 2026-08-02. A truncated download would
         # otherwise surface as a confusing unzip error several minutes later.
         got = os.path.getsize(archive)
-        assert got == 762_423_240, f"expected 762,423,240 bytes, got {got:,}"
+        assert got == 1_086_719_156, f"expected 1,086,719,156 bytes, got {got:,}"
         print(f"downloaded {got / 1e6:.0f} MB")
 
     # -x '__MACOSX/*' matters: the archive carries a ._<ID>.wav resource fork
@@ -464,11 +476,26 @@ else:
     subprocess.run(["unzip", "-q", "-o", archive, "-x", "__MACOSX/*",
                     "-d", str(WORK)], check=True)
 
+import pandas as pd
+N_EXPECTED = len(pd.read_csv(PHASE2_CSV, escapechar="\\\\"))
 n_wav = len(glob.glob(os.path.join(PHASE2_AUDIO, "*.wav")))
-print(f"audio: {PHASE2_AUDIO}  ({n_wav:,} wavs)")
-assert n_wav == 1500, f"expected 1,500 Phase 2 clips, found {n_wav:,}"
+print(f"audio: {PHASE2_AUDIO}  ({n_wav:,} wavs)   csv rows: {N_EXPECTED:,}")
+assert n_wav == N_EXPECTED, (
+    f"{n_wav:,} wavs but {N_EXPECTED:,} csv rows -- if the csv has 1,500 rows "
+    f"it is the OLD one, whose ids match nothing in the corrected audio")
+assert n_wav == 892, f"expected 892 corrected Phase 2 clips, found {n_wav:,}"
 """))
     cells.append(code("""
+# Which model to score with. The corrected test set reopened this question:
+#
+#   ngia/ctc-v2-avg   3 languages (lin lug sna).  On those three: 0.150
+#   ngia/ctc-p2-avg   6 languages (+ ach nyn sog). On those three: 0.156,
+#                     but far better on Acholi / Runyankole / Lusoga
+#
+# ctc-p2 traded a little lin/lug/sna accuracy for a lot of East African, which
+# was right for the old (wrong) test set. Whether it is right now depends on
+# what the corrected set actually contains -- run 6d first and let the measured
+# language mix decide. If it comes back lin/lug/sna, use ctc-v2-avg.
 P2_MODEL = "ngia/ctc-v2-avg"
 P2_OUT = "/kaggle/working/submission.csv"
 """))
@@ -736,7 +763,7 @@ sub = pd.read_csv(P2_OUT, escapechar="\\\\")
 test = pd.read_csv(PHASE2_CSV, escapechar="\\\\")
 
 assert list(sub.columns) == ["ID", "Target"], sub.columns
-assert len(sub) == 1500, f"expected 1,500 rows, got {len(sub):,}"
+assert len(sub) == len(test), f"{len(sub):,} rows vs {len(test):,} in the csv"
 assert sub.ID.tolist() == test.ID.tolist(), "ID order must match Test_phase2.csv"
 assert sub.ID.duplicated().sum() == 0, "duplicate ids"
 
