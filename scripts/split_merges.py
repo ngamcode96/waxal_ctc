@@ -1,5 +1,22 @@
 """Split words the CTC head glued together, using the training vocabulary.
 
+DOES NOT WORK -- kept for the record. Submitted 2026-08-03 with the most
+conservative setting (--top-n 100 --min-count 20, 111 splits): 0.741744 ->
+0.741266. Solving for precision gives 45%, i.e. slightly fewer than half the
+"merges" were real, and the rest broke genuine words. A looser setting would
+have lost several times as much.
+
+Why the proxy misled: an out-of-vocabulary word that decomposes into two
+frequent words is not evidence of a merge. In a 74k-type vocabulary, plenty of
+rare-but-real words decompose by coincidence, and vocabulary membership alone
+cannot tell the two apart -- the rule has no context to judge with. That is
+precisely what an n-gram LM adds.
+
+The error shape also argues against the diagnosis: a wrong word has ~2.5 of its
+8.7 characters wrong, whereas a boundary error makes a word entirely wrong in
+WER while costing one character. The WER/CER asymmetry is real, but it looks
+like near-miss substitutions, not merges.
+
 Measured on the corrected Phase 2 submission (2026-08-03): 411 of 22,909 output
 tokens are out-of-vocabulary words that decompose cleanly into two *frequent*
 training words -- 'yaoyo' -> 'ya oyo', 'pembeya' -> 'pembe ya'. The words being
