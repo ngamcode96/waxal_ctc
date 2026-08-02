@@ -67,7 +67,7 @@ def load_vocab(train_csv: Path, cache_dir: Path | None) -> collections.Counter:
 
 
 def build_splitter(vocab: collections.Counter, min_count: int, min_part: int,
-                   protect_count: int = 1):
+                   protect_count: int = 1, top_n: int = 0):
     """word -> 'a b' for glued words, or None.
 
     Two different thresholds, because these are two different questions:
@@ -84,6 +84,11 @@ def build_splitter(vocab: collections.Counter, min_count: int, min_part: int,
     """
     V = {w for w, n in vocab.items() if n >= min_count}
     protected = {w for w, n in vocab.items() if n >= protect_count}
+    # The measured failure is specifically a *function word* glued to its host:
+    # ya (rank 1), na (2), ba (4), ne, pe, zve. Requiring one half to be that
+    # common is what separates a real merge from a rare word that merely happens
+    # to decompose -- 'ne masutu' survives, 'sport si' and 'mai ndi' do not.
+    top = set(sorted(vocab, key=lambda w: -vocab[w])[:top_n]) if top_n else None
     cache: dict[str, str | None] = {}
 
     def split(word: str) -> str | None:
@@ -95,8 +100,14 @@ def build_splitter(vocab: collections.Counter, min_count: int, min_part: int,
             best = 0
             for i in range(min_part, len(key) - min_part + 1):
                 a, b = key[:i], key[i:]
-                if a in V and b in V:
-                    s = min(vocab[a], vocab[b])
+                if a in V and b in V and (top is None or a in top or b in top):
+                    # Sum, not min. The merges being targeted are a very common
+                    # function word glued to an ordinary one -- 'na mazitombo',
+                    # 'zve mudenga' -- so one half is enormous and the other is
+                    # not. min() scores that pair by its rare half and loses to
+                    # a spurious split into two middling words: it chose
+                    # 'nema sutu' over 'ne masutu'. Sum picks the function word.
+                    s = vocab[a] + vocab[b]
                     if s > best:
                         best, out = s, (i,)
             if out:
@@ -105,15 +116,20 @@ def build_splitter(vocab: collections.Counter, min_count: int, min_part: int,
         return out
 
     def apply(token: str) -> str:
-        """Split one token, preserving its casing and trailing punctuation."""
+        """Split one token, preserving its casing and surrounding punctuation."""
         core = word_chars(token)
         if not core:
+            return token
+        # Only edge punctuation is safe. With punctuation *inside* the token
+        # ('motani,pe') the stripped core is not a substring of the original,
+        # find() returns -1, and the slice arithmetic silently produces garbage
+        # -- it emitted 'motani,pmotani pepe'. Leave those alone.
+        at = token.find(core)
+        if at < 0:
             return token
         i = split(core)
         if i is None:
             return token
-        # Locate the core inside the token so punctuation stays where it was.
-        at = token.lower().find(core.lower())
         head, tail = token[:at], token[at + len(core):]
         return f"{head}{core[:i]} {core[i:]}{tail}"
 
@@ -144,6 +160,10 @@ def main() -> int:
                     help="each half must appear at least this often in training")
     ap.add_argument("--min-part", type=int, default=2,
                     help="shortest allowed half")
+    ap.add_argument("--top-n", type=int, default=100,
+                    help="one half must be among the N most frequent training "
+                         "words. 0 disables. This is what distinguishes a real "
+                         "merge from a rare word that happens to decompose")
     ap.add_argument("--protect-count", type=int, default=1,
                     help="never split a word attested at least this often in training. 1 protects anything seen at all -- the conservative default, since splitting a real word costs exactly as much as fixing a merge saves")
     args = ap.parse_args()
@@ -153,7 +173,7 @@ def main() -> int:
 
     vocab = load_vocab(args.train_csv, args.cache_dir)
     apply, V = build_splitter(vocab, args.min_count, args.min_part,
-                          args.protect_count)
+                              args.protect_count, args.top_n)
     print(f"vocabulary: {len(vocab):,} types, {len(V):,} at >= {args.min_count} "
           f"occurrences")
 
